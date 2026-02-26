@@ -1,0 +1,65 @@
+# 默认不安装 torch/torchvision/torchaudio，避免覆盖你已配置好的 CUDA/PyTorch 环境。
+# 如果需要“从零安装 torch”，请使用 requirements-cuda12.txt。
+transformers>=4.45.0
+
+# TRL和PEFT (核心)
+trl>=0.15.0           # HuggingFace RL库（本项目GRPO需 GRPOTrainer/GRPOConfig）
+peft>=0.12.0          # LoRA等高效微调方法
+
+# 数据处理
+datasets>=3.0.0
+numpy
+pandas
+
+# 训练加速和实验追踪
+accelerate>=1.0.0     # 分布式训练和混合精度
+wandb>=0.18.0         # 实验追踪和可视化
+
+# 可视化和日志
+tensorboard
+matplotlib>=3.5.0
+tqdm                  # 进度条
+pygame                # 游戏可视化（用于visualize_2048.py）
+
+# 测试
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# 工具库
+scipy
+einops               # 张量操作
+rich                 # 终端美化输出
+
+# ==============================================================================
+# 组合优化依赖
+# ==============================================================================
+
+# 组合1: Unsloth + bitsandbytes + Flash Attention 2 (训练优化 3-5x)
+unsloth              # 优化的HuggingFace，专为LoRA训练加速
+bitsandbytes>=0.43.0 # 4-bit/8-bit量化（CUDA 12.x 建议 0.43+）
+# flash-attn>=2.0.0  # Flash Attention 2 (需要CUDA) - 编译慢，见下方快速安装方案
+
+# 组合2: vLLM + INT8量化 (推理优化 10-50x)
+vllm>=0.6.0          # 高性能推理引擎 (PagedAttention)
+
+# ==============================================================================
+# Flash Attention 2 信息
+# ==============================================================================
+#
+# ⚠️ flash-attn 已从默认依赖中移除（编译困难，安装时间长）
+#
+# 当前配置：
+# ✅ 默认不使用 flash-attn（代码中 use_flash_attn=False）
+# ✅ 训练仍可正常进行，使用 Unsloth + bitsandbytes 优化（2-3x加速）
+# ✅ 如需额外10-20%性能提升，可单独安装 flash-attn
+#
+# 可选安装（如果需要）：
+#   pip install flash-attn --no-build-isolation
+#
+# 安装后需要：
+#   训练时添加 --use_flash_attn 参数
+#
+# 注意事项:
+# - vllm 需要 CUDA 11.8+ 或 ROCm 5.7+
+# - 不安装 flash-attn 完全不影响训练
+# - 推荐：先不安装，训练正常后再考虑是否安装
