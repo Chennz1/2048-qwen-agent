@@ -44,24 +44,24 @@ GRPO_DIR="checkpoints/grpo_smoke"
 EVAL_ROOT="data/eval/smoke_sft_grpo"
 
 NUM_GAMES=20
-SFT_TRAIN_SAMPLES=256
+SFT_TRAIN_SAMPLES=512
 SFT_SUBSET_SEED=42
 EXPERT_DEPTH=2
 EXPERT_MAX_EMPTY=8
 
 SFT_EPOCHS=1
-SFT_BATCH_SIZE=1
-SFT_GRAD_ACCUM=8
+SFT_BATCH_SIZE=16
+SFT_GRAD_ACCUM=1
 
 GRPO_EPOCHS=1
 GRPO_NUM_SAMPLES=512
+GRPO_GRAD_ACCUM=4
 GRPO_BATCH_SIZE=8
-GRPO_GRAD_ACCUM=8
 GRPO_NUM_GENERATIONS=8
 GRPO_MAX_PROMPT_LENGTH=512
-GRPO_MAX_COMPLETION_LENGTH=128
+GRPO_MAX_COMPLETION_LENGTH=256
 
-EVAL_GAMES=1
+EVAL_GAMES=32
 
 USE_UNSLOTH=false
 LOAD_IN_4BIT=true
@@ -140,7 +140,7 @@ echo "grpo_samples=$GRPO_NUM_SAMPLES"
 echo "grpo_num_generations=$GRPO_NUM_GENERATIONS"
 echo "eval_games=$EVAL_GAMES"
 
-rm -rf "$RAW_DIR" "$PROCESSED_DIR" "$SFT_TRAIN_DIR" "$SFT_DIR" "$GRPO_DIR" "$EVAL_ROOT"
+# rm -rf "$RAW_DIR" "$PROCESSED_DIR" "$SFT_TRAIN_DIR" "$SFT_DIR" "$GRPO_DIR" "$EVAL_ROOT"
 
 echo "==> [1/7] generate expert CoT raw data"
 bash scripts/generate_expert_cot_data.sh \
@@ -150,7 +150,7 @@ bash scripts/generate_expert_cot_data.sh \
   --output_dir "$RAW_DIR"
 
 echo "==> [2/7] process raw -> processed"
-python -m src.data.processor \
+python -m src.data_gen.processor \
   --input_dir "$RAW_DIR" \
   --output_dir "$PROCESSED_DIR" \
   --use_thinking \
@@ -194,37 +194,11 @@ python -m src.models.trl_train \
   $( [ "$LOAD_IN_4BIT" = true ] && echo "--load_in_4bit" ) \
   $( [ "$USE_FLASH_ATTN" = true ] && echo "--use_flash_attn" )
 
-echo "==> [6/8] preflight check: TRL GRPO availability"
-python - <<'PY'
-import importlib
-from importlib.metadata import PackageNotFoundError, version
 
-try:
-    importlib.import_module("trl").GRPOConfig  # type: ignore[attr-defined]
-    importlib.import_module("trl").GRPOTrainer  # type: ignore[attr-defined]
-    print("TRL GRPO symbols found in trl top-level.")
-except Exception:
-    try:
-        importlib.import_module("trl.trainer.grpo_config").GRPOConfig
-        importlib.import_module("trl.trainer.grpo_trainer").GRPOTrainer
-        print("TRL GRPO symbols found in trl.trainer submodules.")
-    except Exception as exc:
-        try:
-            v = version("trl")
-        except (PackageNotFoundError, Exception):
-            v = "not_installed"
-        raise SystemExit(
-            f"GRPO preflight failed: trl={v} does not expose GRPO API. "
-            "Please run: pip install -U \"trl>=0.15.0\". "
-            f"Inner error: {type(exc).__name__}: {exc}"
-        )
-PY
-
-echo "==> [7/8] train GRPO"
+echo "==> [7/8] train GRPO (raw -> prompt-only)"
 python -m src.models.grpo \
   --model "$SFT_DIR" \
   --output_dir "$GRPO_DIR" \
-  --data_source raw \
   --input_dir "$RAW_DIR" \
   --num_samples "$GRPO_NUM_SAMPLES" \
   --epochs "$GRPO_EPOCHS" \

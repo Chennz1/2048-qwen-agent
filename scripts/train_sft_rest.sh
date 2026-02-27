@@ -92,7 +92,7 @@ echo "=========================================="
 if [ ! -d "data/processed/train" ]; then
     echo "生成SFT训练数据..."
     bash scripts/generate_data.sh --num_games "$NUM_GAMES" --difficulty "$DIFFICULTY"
-    python -m src.data.processor --use_thinking --validate --analyze
+    python -m src.data_gen.processor --use_thinking --validate --analyze
 else
     echo "✓ 数据已存在"
 fi

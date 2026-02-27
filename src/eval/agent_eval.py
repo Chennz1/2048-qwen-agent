@@ -10,6 +10,7 @@ Supports:
 
 from __future__ import annotations
 
+import ast
 import argparse
 import hashlib
 import json
@@ -24,15 +25,15 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from src.data.generator import ThinkingHeuristicPlayer
-from src.data.prompting import format_inference_prompt
+from src.data_gen.generator import ThinkingHeuristicPlayer
+from src.data_gen.prompting import format_inference_prompt
 from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_text
 
 # Hugging Face mirror defaults (honor existing env if user already set it).
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from peft import PeftModel
@@ -94,6 +95,17 @@ class AgentBase:
     def decide(self, game: Game2048, state_text: str, temperature: Optional[float]) -> AgentDecision:
         raise NotImplementedError
 
+    def decide_batch(
+        self,
+        games: List[Game2048],
+        state_texts: List[str],
+        temperature: Optional[float],
+    ) -> List[AgentDecision]:
+        decisions: List[AgentDecision] = []
+        for game, state_text in zip(games, state_texts):
+            decisions.append(self.decide(game=game, state_text=state_text, temperature=temperature))
+        return decisions
+
 
 class RandomBaselineAgent(AgentBase):
     name = "random_baseline"
@@ -146,6 +158,7 @@ class LLMAgent(AgentBase):
         self.is_base_model = is_base_model
         self.use_thinking = use_thinking
         self.presence_penalty = float(np.clip(float(presence_penalty), 0.0, 2.0))
+        self.model_type = "base_model" if is_base_model or model_path is None else "finetuned"
 
         self.use_vllm = bool(use_vllm and VLLM_AVAILABLE)
         self.vllm_model = None
@@ -154,10 +167,14 @@ class LLMAgent(AgentBase):
         if use_vllm and not VLLM_AVAILABLE:
             print("[LLM] vLLM 未安装，回退到 transformers 模式")
 
+        # Align with latest evaluator policy: default to BF16/FP16 and avoid bnb quantization.
+        if load_in_4bit or load_in_8bit:
+            print("[LLM] 已忽略 load_in_4bit/load_in_8bit：评测默认使用 BF16/FP16，不使用 bitsandbytes 量化")
+
         if self.use_vllm:
             self._init_vllm(vllm_quantization)
         else:
-            self._init_standard(device=device, load_in_4bit=load_in_4bit, load_in_8bit=load_in_8bit)
+            self._init_standard(device=device)
 
     @staticmethod
     def _is_lora_adapter_checkpoint(model_path: Optional[str]) -> bool:
@@ -177,7 +194,42 @@ class LLMAgent(AgentBase):
             raise ValueError(f"Cannot find base_model_name_or_path in {adapter_cfg}")
         return base
 
+    @staticmethod
+    def _resolve_lora_rank_from_adapter(adapter_path: str) -> Optional[int]:
+        adapter_cfg = Path(adapter_path) / "adapter_config.json"
+        if not adapter_cfg.exists():
+            return None
+        try:
+            with open(adapter_cfg, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            return None
+        rank = cfg.get("r")
+        if rank is None:
+            return None
+        try:
+            rank_i = int(rank)
+        except Exception:
+            return None
+        return rank_i if rank_i > 0 else None
+
+    @staticmethod
+    def _normalize_vllm_quantization(quantization: Optional[str]) -> Optional[str]:
+        if not quantization:
+            return None
+        q = str(quantization).strip().lower()
+        alias = {
+            "int8": "bitsandbytes",
+            "bnb": "bitsandbytes",
+        }
+        return alias.get(q, q)
+
+    @staticmethod
+    def _ensure_vllm_multiproc_spawn() -> None:
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
     def _init_vllm(self, quantization: Optional[str]) -> None:
+        self._ensure_vllm_multiproc_spawn()
         model_ref = self.base_model
         if self.is_base_model or not self.model_path:
             model_ref = self.base_model
@@ -193,20 +245,40 @@ class LLMAgent(AgentBase):
         kwargs = {
             "model": model_ref,
             "gpu_memory_utilization": 0.9,
-            "max_model_len": 2048,
+            "max_model_len": 1024,
             "tensor_parallel_size": 1,
             "trust_remote_code": True,
         }
-
-        if quantization:
-            kwargs["quantization"] = quantization
 
         if self.model_path and (not self.is_base_model) and self._is_lora_adapter_checkpoint(self.model_path):
             if not VLLM_LORA_AVAILABLE:
                 raise RuntimeError("vLLM LoRARequest 不可用，请升级 vLLM 或关闭 --use_vllm")
             kwargs["enable_lora"] = True
+            lora_rank = self._resolve_lora_rank_from_adapter(self.model_path)
+            if lora_rank is not None:
+                kwargs["max_lora_rank"] = max(16, lora_rank)
+                print(f"[LLM] vLLM max_lora_rank={kwargs['max_lora_rank']} (adapter r={lora_rank})")
 
-        self.vllm_model = LLM(**kwargs)
+        normalized_quant = self._normalize_vllm_quantization(quantization)
+        if normalized_quant:
+            if normalized_quant != str(quantization).strip().lower():
+                print(f"[LLM] vLLM 量化别名映射: {quantization} -> {normalized_quant}")
+            kwargs["quantization"] = normalized_quant
+
+        try:
+            self.vllm_model = LLM(**kwargs)
+        except Exception as exc:
+            if normalized_quant and "quantization" in str(exc).lower():
+                print(f"[LLM] vLLM quantization={normalized_quant} 初始化失败，回退到无量化 vLLM")
+                kwargs.pop("quantization", None)
+                self.vllm_model = LLM(**kwargs)
+            elif "Cannot re-initialize CUDA in forked subprocess" in str(exc):
+                raise RuntimeError(
+                    "vLLM 初始化失败（CUDA+fork），请设置 VLLM_WORKER_MULTIPROC_METHOD=spawn 或关闭 --use_vllm"
+                ) from exc
+            else:
+                raise
+
         self.tokenizer = self.vllm_model.get_tokenizer()
 
         if self.model_path and (not self.is_base_model) and self._is_lora_adapter_checkpoint(self.model_path):
@@ -214,8 +286,10 @@ class LLMAgent(AgentBase):
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        if getattr(self.tokenizer, "padding_side", None) != "left":
+            self.tokenizer.padding_side = "left"
 
-    def _init_standard(self, device: str, load_in_4bit: bool, load_in_8bit: bool) -> None:
+    def _init_standard(self, device: str) -> None:
         is_adapter = bool(self.model_path) and self._is_lora_adapter_checkpoint(self.model_path)
 
         if self.is_base_model or not self.model_path:
@@ -235,26 +309,15 @@ class LLMAgent(AgentBase):
             need_lora = False
             print(f"[LLM] transformers 加载完整模型: {model_to_load}")
 
-        bnb_config = None
-        if load_in_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-        elif load_in_8bit:
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         model_kwargs = {
-            "torch_dtype": torch.float16,
+            "torch_dtype": torch.bfloat16 if use_bf16 else torch.float16,
             "device_map": device,
             "trust_remote_code": True,
         }
-        if bnb_config is not None:
-            model_kwargs["quantization_config"] = bnb_config
 
         self.model = AutoModelForCausalLM.from_pretrained(model_to_load, **model_kwargs)
+        print(f"[LLM] 推理精度: {'bf16' if use_bf16 else 'fp16'}")
 
         if need_lora:
             if not PEFT_AVAILABLE:
@@ -264,6 +327,8 @@ class LLMAgent(AgentBase):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_to_load, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        if getattr(self.tokenizer, "padding_side", None) != "left":
+            self.tokenizer.padding_side = "left"
 
         self.model.eval()
 
@@ -297,22 +362,47 @@ class LLMAgent(AgentBase):
         }
 
     def decide(self, game: Game2048, state_text: str, temperature: Optional[float]) -> AgentDecision:
-        prompt = format_inference_prompt(
-            tokenizer=self.tokenizer,
-            state_text=state_text,
-            use_thinking=self.use_thinking,
-        )
+        return self.decide_batch(
+            games=[game],
+            state_texts=[state_text],
+            temperature=temperature,
+        )[0]
 
+    def decide_batch(
+        self,
+        games: List[Game2048],
+        state_texts: List[str],
+        temperature: Optional[float],
+    ) -> List[AgentDecision]:
+        if not state_texts:
+            return []
         if self.use_vllm:
-            action, response = self._predict_vllm(prompt, temperature)
+            actions, responses = self._predict_batch_vllm(state_texts, temperature)
         else:
-            action, response = self._predict_standard(prompt, temperature)
+            actions, responses = self._predict_batch_standard(state_texts, temperature)
 
-        thinking = self._extract_thinking(response) if self.use_thinking else ""
-        return AgentDecision(action=action, raw_response=response, thinking=thinking)
+        decisions: List[AgentDecision] = []
+        for action, response in zip(actions, responses):
+            thinking = self._extract_thinking(response) if self.use_thinking else ""
+            decisions.append(
+                AgentDecision(action=int(action), raw_response=response, thinking=thinking)
+            )
+        return decisions
 
-    def _predict_vllm(self, prompt: str, temperature: Optional[float]) -> Tuple[int, str]:
+    def _predict_batch_vllm(
+        self,
+        state_texts: List[str],
+        temperature: Optional[float],
+    ) -> Tuple[List[int], List[str]]:
         sampling = self._resolve_sampling(temperature)
+        prompts = [
+            format_inference_prompt(
+                tokenizer=self.tokenizer,
+                state_text=state_text,
+                use_thinking=self.use_thinking,
+            )
+            for state_text in state_texts
+        ]
         sampling_params = SamplingParams(
             temperature=sampling["temperature"],
             top_p=sampling["top_p"],
@@ -323,23 +413,50 @@ class LLMAgent(AgentBase):
         )
 
         if self.vllm_lora_request is not None:
-            outputs = self.vllm_model.generate([prompt], sampling_params, lora_request=self.vllm_lora_request)
+            outputs = self.vllm_model.generate(
+                prompts,
+                sampling_params,
+                lora_request=self.vllm_lora_request,
+                use_tqdm=False,
+            )
         else:
-            outputs = self.vllm_model.generate([prompt], sampling_params)
+            outputs = self.vllm_model.generate(prompts, sampling_params, use_tqdm=False)
 
-        response = outputs[0].outputs[0].text
-        action = parse_action_from_text(response)
-        return action, response
+        responses: List[str] = []
+        actions: List[int] = []
+        for out in outputs:
+            response = out.outputs[0].text if out.outputs else ""
+            responses.append(response)
+            actions.append(parse_action_from_text(response))
+        return actions, responses
 
-    def _predict_standard(self, prompt: str, temperature: Optional[float]) -> Tuple[int, str]:
+    def _predict_batch_standard(
+        self,
+        state_texts: List[str],
+        temperature: Optional[float],
+    ) -> Tuple[List[int], List[str]]:
         sampling = self._resolve_sampling(temperature)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        prompts = [
+            format_inference_prompt(
+                tokenizer=self.tokenizer,
+                state_text=state_text,
+                use_thinking=self.use_thinking,
+            )
+            for state_text in state_texts
+        ]
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        )
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
         with torch.no_grad():
             generate_kwargs = {
                 **inputs,
-                "max_new_tokens": 256 if self.use_thinking else 64,
+                "max_new_tokens": 768 if self.use_thinking else 64,
                 "temperature": sampling["temperature"],
                 "top_p": sampling["top_p"],
                 "top_k": sampling["top_k"],
@@ -356,17 +473,55 @@ class LLMAgent(AgentBase):
                 generate_kwargs["min_p"] = sampling["min_p"]
             outputs = self.model.generate(**generate_kwargs)
 
-        response = self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
-        action = parse_action_from_text(response)
-        return action, response
+        prompt_len = inputs["input_ids"].shape[1]
+        responses: List[str] = []
+        actions: List[int] = []
+        for seq in outputs:
+            response = self.tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
+            responses.append(response)
+            actions.append(parse_action_from_text(response))
+        return actions, responses
 
 
-def derive_episode_seed(base_seed: Optional[int], index: int, tag: str = "") -> Optional[int]:
+def derive_episode_seed(
+    base_seed: Optional[int],
+    index: int,
+    tag: str = "",
+    sample: Optional[Dict] = None,
+) -> Optional[int]:
     if base_seed is None:
         return None
     material = f"{int(base_seed)}:{int(index)}:{tag}"
+    if sample:
+        material += (
+            f":{sample.get('source_game_id', '')}"
+            f":{sample.get('source_step', '')}"
+            f":{sample.get('bucket', '')}"
+        )
     digest = hashlib.blake2b(material.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big") % (2**32)
+
+
+def load_eval_set(path: str) -> List[Dict]:
+    samples: List[Dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            samples.append(json.loads(line))
+    return samples
+
+
+def init_game_from_sample(sample: Dict, seed: Optional[int]) -> Game2048:
+    game = Game2048(seed=seed)
+    grid = np.array(ast.literal_eval(sample["state"]), dtype=int)
+    if grid.shape != (4, 4):
+        raise ValueError(f"Invalid state shape: {grid.shape}")
+    game.grid = grid
+    game.score = int(sample.get("start_score", 0))
+    game.game_over = game._is_game_over()
+    return game
 
 
 def setup_global_seed(seed: Optional[int]) -> None:
@@ -419,66 +574,106 @@ def evaluate_agent(
     seed: Optional[int],
     visualize_game: bool,
     visualize_delay: float,
+    batch_size: int = 1,
+    eval_samples: Optional[List[Dict]] = None,
+    verbose: bool = True,
 ) -> Dict:
     setup_global_seed(seed)
+
+    total_games = len(eval_samples) if eval_samples is not None else int(num_games)
+    batch_size = max(1, int(batch_size))
 
     scores: List[int] = []
     max_tiles: List[int] = []
     legal_move_ratios: List[float] = []
     steps_list: List[int] = []
+    bucket_counter: Dict[str, int] = {}
 
-    for game_idx in range(num_games):
-        game_seed = derive_episode_seed(seed, game_idx, tag=agent.name)
-        game = Game2048(seed=game_seed)
-        game.reset()
+    completed = 0
+    for start in range(0, total_games, batch_size):
+        end = min(start + batch_size, total_games)
+        records: List[Dict] = []
 
-        total_moves = 0
-        legal_moves = 0
+        for game_idx in range(start, end):
+            if eval_samples is not None:
+                sample = eval_samples[game_idx]
+                game_seed = derive_episode_seed(seed, game_idx, tag=agent.name, sample=sample)
+                game = init_game_from_sample(sample=sample, seed=game_seed)
+                bucket = sample.get("bucket", "unknown")
+                bucket_counter[bucket] = bucket_counter.get(bucket, 0) + 1
+            else:
+                game_seed = derive_episode_seed(seed, game_idx, tag=agent.name)
+                game = Game2048(seed=game_seed)
+                game.reset()
+
+            records.append(
+                {
+                    "game": game,
+                    "game_idx": game_idx,
+                    "done": bool(game.game_over),
+                    "total_moves": 0,
+                    "legal_moves": 0,
+                }
+            )
 
         for step_idx in range(max_steps):
-            state_text = game._get_state()
-            decision = agent.decide(game=game, state_text=state_text, temperature=temperature)
-
-            valid_actions = game.get_valid_actions()
-            is_legal = decision.action in valid_actions
-            applied_action = decision.action
-
-            if is_legal:
-                legal_moves += 1
-                _, _, done, _ = game.step(applied_action)
-            else:
-                if valid_actions:
-                    applied_action = valid_actions[0]
-                    _, _, done, _ = game.step(applied_action)
-                else:
-                    done = True
-
-            if visualize_game and game_idx == 0:
-                print_step_view(
-                    game_idx=game_idx,
-                    step_idx=step_idx,
-                    game=game,
-                    decision=decision,
-                    applied_action=applied_action,
-                    is_legal=is_legal,
-                    valid_actions=valid_actions,
-                )
-                if visualize_delay > 0:
-                    time.sleep(visualize_delay)
-
-            total_moves += 1
-            if done:
+            active_indices = [i for i, rec in enumerate(records) if not rec["done"]]
+            if not active_indices:
                 break
 
-        scores.append(int(game.score))
-        max_tiles.append(int(game.get_max_tile()))
-        legal_move_ratios.append(float(legal_moves / total_moves if total_moves > 0 else 0.0))
-        steps_list.append(int(total_moves))
+            active_games = [records[i]["game"] for i in active_indices]
+            states = [game._get_state() for game in active_games]
+            decisions = agent.decide_batch(games=active_games, state_texts=states, temperature=temperature)
 
-        print(f"进度: {game_idx + 1}/{num_games} | score={game.score} | max_tile={game.get_max_tile()}")
+            for rec_idx, decision in zip(active_indices, decisions):
+                rec = records[rec_idx]
+                game = rec["game"]
+
+                valid_actions = game.get_valid_actions()
+                is_legal = decision.action in valid_actions
+                applied_action = decision.action
+
+                if is_legal:
+                    rec["legal_moves"] += 1
+                    _, _, done, _ = game.step(applied_action)
+                else:
+                    if valid_actions:
+                        applied_action = valid_actions[0]
+                        _, _, done, _ = game.step(applied_action)
+                    else:
+                        done = True
+
+                if visualize_game and rec["game_idx"] == 0:
+                    print_step_view(
+                        game_idx=rec["game_idx"],
+                        step_idx=step_idx,
+                        game=game,
+                        decision=decision,
+                        applied_action=applied_action,
+                        is_legal=is_legal,
+                        valid_actions=valid_actions,
+                    )
+                    if visualize_delay > 0:
+                        time.sleep(visualize_delay)
+
+                rec["total_moves"] += 1
+                rec["done"] = bool(done)
+
+        for rec in records:
+            game = rec["game"]
+            total_moves = int(rec["total_moves"])
+            scores.append(int(game.score))
+            max_tiles.append(int(game.get_max_tile()))
+            legal_move_ratios.append(float(rec["legal_moves"] / total_moves if total_moves > 0 else 0.0))
+            steps_list.append(total_moves)
+            completed += 1
+            if verbose:
+                print(
+                    f"进度: {completed}/{total_games} | score={game.score} | max_tile={game.get_max_tile()}"
+                )
 
     results = {
-        "num_games": num_games,
+        "num_games": total_games,
         "mean_score": float(np.mean(scores)),
         "std_score": float(np.std(scores)),
         "max_score": int(np.max(scores)),
@@ -493,6 +688,8 @@ def evaluate_agent(
         "legal_move_ratios": legal_move_ratios,
         "steps": steps_list,
     }
+    if eval_samples is not None:
+        results["bucket_distribution"] = bucket_counter
     return results
 
 
@@ -609,7 +806,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--is_base_model", action="store_true")
 
     parser.add_argument("--use_vllm", action="store_true")
-    parser.add_argument("--vllm_quantization", type=str, default="int8", choices=["int8", "awq", "gptq"])
+    parser.add_argument(
+        "--vllm_quantization",
+        type=str,
+        default=None,
+        help="vLLM quantization: bitsandbytes/awq/gptq (int8 会映射为 bitsandbytes)",
+    )
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--load_in_8bit", action="store_true")
     parser.add_argument("--device", type=str, default="auto")
@@ -622,6 +824,8 @@ def parse_args() -> argparse.Namespace:
     # Eval options
     parser.add_argument("--num_games", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=1, help="并行评测 batch 大小")
+    parser.add_argument("--eval_set", type=str, default=None, help="固定快照评测集路径（jsonl）")
     parser.add_argument(
         "--temperature",
         type=float,
@@ -655,11 +859,26 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.agent_type == "llm" and args.is_base_model and args.model_path:
+        print("⚠️  --is_base_model 已启用，忽略 --model_path")
+        args.model_path = None
+
     if args.quick:
-        if args.num_games == 100:
+        if args.eval_set is None and args.num_games == 100:
             args.num_games = 8
         if args.max_steps == 1000:
             args.max_steps = 200
+
+    eval_samples: Optional[List[Dict]] = None
+    if args.eval_set:
+        eval_samples = load_eval_set(args.eval_set)
+        if not eval_samples:
+            raise ValueError(f"空 eval_set: {args.eval_set}")
+        args.num_games = len(eval_samples)
+
+    if args.visualize_game and args.batch_size > 1:
+        print("⚠️  --visualize_game 与批量评测冲突，已自动将 --batch_size 设为 1")
+        args.batch_size = 1
 
     if args.dry_run:
         print("dry_run 配置:")
@@ -678,6 +897,8 @@ def main() -> None:
         print(f"  presence_penalty: {args.presence_penalty}")
     print(f"  num_games: {args.num_games}")
     print(f"  max_steps: {args.max_steps}")
+    print(f"  batch_size: {args.batch_size}")
+    print(f"  eval_set: {args.eval_set}")
     if args.temperature is None:
         default_temp = THINKING_SAMPLING_DEFAULTS["temperature"] if args.use_thinking else NON_THINKING_SAMPLING_DEFAULTS["temperature"]
         print(f"  temperature: auto ({default_temp})")
@@ -693,10 +914,16 @@ def main() -> None:
         seed=args.seed,
         visualize_game=args.visualize_game,
         visualize_delay=max(0.0, float(args.visualize_delay)),
+        batch_size=args.batch_size,
+        eval_samples=eval_samples,
+        verbose=True,
     )
 
     results["agent_type"] = args.agent_type
     results["seed"] = args.seed
+    results["batch_size"] = int(args.batch_size)
+    if args.eval_set:
+        results["eval_set_path"] = args.eval_set
     results["temperature"] = (
         args.temperature
         if args.temperature is not None
@@ -713,6 +940,7 @@ def main() -> None:
         results["is_base_model"] = bool(args.is_base_model)
         results["use_thinking"] = bool(args.use_thinking)
         results["presence_penalty"] = float(np.clip(float(args.presence_penalty), 0.0, 2.0))
+        results["model_type"] = getattr(agent, "model_type", "unknown")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -150,7 +150,7 @@ echo ""
 # 检查数据
 if [ ! -d "$TRAIN_DATA" ]; then
     echo "❌ 错误: 找不到训练数据 $TRAIN_DATA"
-    echo "请先运行: python -m src.data.processor"
+    echo "请先运行: python -m src.data_gen.processor"
     exit 1
 fi
 

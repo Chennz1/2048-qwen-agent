@@ -138,7 +138,7 @@ bash scripts/generate_expert_cot_data.sh \
 ### 2) raw -> processed 并校验数据合同
 
 ```bash
-python -m src.data.processor \
+python -m src.data_gen.processor \
   --input_dir data/raw \
   --output_dir data/processed \
   --use_thinking \
@@ -303,7 +303,7 @@ bash scripts/evaluate_three_agents.sh \
 2. 入门教程：`docs/BEGINNER_WORKFLOW_TUTORIAL.md`
 3. 评测基线设计：`docs/workflow/05_EVALUATION_BASELINES.md`
 4. 开发与测试：`docs/DEVELOPMENT.md`
-5. 模块说明：`src/data/readme.md`、`src/envs/readme.md`、`src/models/readme.md`、`src/eval/readme.md`
+5. 模块说明：`src/data_gen/readme.md`、`src/envs/readme.md`、`src/models/readme.md`、`src/eval/readme.md`
 
 ## 注意事项
 

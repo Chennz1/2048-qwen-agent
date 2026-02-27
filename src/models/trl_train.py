@@ -47,6 +47,32 @@ def _try_import_unsloth():
         return None
 
 
+def _is_message_sequence(value) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and isinstance(value[0], dict)
+        and "role" in value[0]
+        and "content" in value[0]
+    )
+
+
+def _ensure_prompt_completion_dataset(dataset, split_name: str) -> None:
+    cols = set(getattr(dataset, "column_names", []))
+    required = {"prompt", "completion"}
+    missing = required - cols
+    if missing:
+        raise ValueError(f"{split_name} dataset missing required columns: {sorted(missing)}")
+    if len(dataset) == 0:
+        return
+
+    sample = dataset[0]
+    if not _is_message_sequence(sample.get("prompt")):
+        raise ValueError(f"{split_name} sample `prompt` must be non-empty message list")
+    if not _is_message_sequence(sample.get("completion")):
+        raise ValueError(f"{split_name} sample `completion` must be non-empty message list")
+
+
 def _build_sft_config(
     *,
     output_dir: str,
@@ -60,6 +86,7 @@ def _build_sft_config(
     load_in_4bit: bool,
     load_in_8bit: bool,
     tokenizer=None,
+    completion_only_loss: bool = True,
 ):
     """Build SFTConfig with runtime compatibility across TRL versions."""
     params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
@@ -75,7 +102,8 @@ def _build_sft_config(
         "learning_rate": learning_rate,
         "warmup_ratio": 0.1,
         "lr_scheduler_type": "cosine",
-        "logging_steps": 10,
+        "disable_tqdm": True,
+        "logging_steps": 4,
         "save_strategy": "epoch",
         "save_total_limit": 3,
         "gradient_checkpointing": True,
@@ -99,7 +127,10 @@ def _build_sft_config(
         kwargs["evaluation_strategy"] = "epoch"
 
     if "dataset_text_field" in params:
-        kwargs["dataset_text_field"] = "text"
+        # We train with prompt/completion conversational samples, not legacy text field.
+        kwargs["dataset_text_field"] = None
+    if "completion_only_loss" in params:
+        kwargs["completion_only_loss"] = bool(completion_only_loss)
 
     if "max_seq_length" in params:
         kwargs["max_seq_length"] = seq_len
@@ -151,6 +182,7 @@ def _build_sft_trainer(
     train_dataset,
     eval_dataset,
     tokenizer,
+    data_collator=None,
 ):
     """Build SFTTrainer with runtime compatibility across TRL versions."""
     params = set(inspect.signature(SFTTrainer.__init__).parameters.keys())
@@ -173,6 +205,8 @@ def _build_sft_trainer(
         kwargs["eos_token_id"] = int(tokenizer.eos_token_id)
     if "pad_token_id" in params and getattr(tokenizer, "pad_token_id", None) is not None:
         kwargs["pad_token_id"] = int(tokenizer.pad_token_id)
+    if "data_collator" in params and data_collator is not None:
+        kwargs["data_collator"] = data_collator
 
     return SFTTrainer(**kwargs)
 
@@ -193,6 +227,7 @@ def train_sft(
     load_in_4bit: bool = True,
     load_in_8bit: bool = False,
     use_flash_attn: bool = False,
+    completion_only_loss: bool = True,
 ):
     """
     使用TRL的SFTTrainer进行监督微调
@@ -280,6 +315,9 @@ def train_sft(
 
     print(f"  训练集: {len(train_dataset)} 样本")
     print(f"  验证集: {len(val_dataset)} 样本")
+    _ensure_prompt_completion_dataset(train_dataset, "train")
+    _ensure_prompt_completion_dataset(val_dataset, "val")
+    print("  数据集格式: conversational prompt-completion")
 
     # 2. 加载模型和Tokenizer
     print("\n🔤 加载Tokenizer...")
@@ -364,12 +402,22 @@ def train_sft(
         load_in_4bit=load_in_4bit,
         load_in_8bit=load_in_8bit,
         tokenizer=tokenizer,
+        completion_only_loss=completion_only_loss,
     )
+
     print(
         "🧪 Precision config:",
         f"fp16={getattr(sft_config, 'fp16', None)}",
         f"bf16={getattr(sft_config, 'bf16', None)}",
     )
+
+    if hasattr(sft_config, "completion_only_loss"):
+        setattr(sft_config, "completion_only_loss", True)
+    else:
+        raise RuntimeError(
+            "当前TRL版本不支持 `completion_only_loss`。请升级TRL后再训练（建议 >= 0.15）。"
+        )
+    print("🧠 使用 TRL completion_only_loss=True（官方路径）")
 
     # 5. 创建Trainer
     print("🚀 创建SFTTrainer...")
@@ -448,6 +496,7 @@ def train_with_custom_reward(
         mini_batch_size=32,
         gradient_accumulation_steps=4,
     )
+    _ = ppo_config
 
     print("创建PPOTrainer...")
     # 注意：这里需要自定义reward函数

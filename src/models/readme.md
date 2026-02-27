@@ -48,7 +48,7 @@
 - 作用：集中管理 LoRA 参数，减少重复配置。
 
 ## 训练数据要求
-- 推荐输入：`src/data/processor.py` 产出的 `data/processed/*`
+- 推荐输入：`src/data_gen/processor.py` 产出的 `data/processed/*`
 - 样本字段：至少包含 `text`
 - 训练模板：应与推理模板保持一致（同 tokenizer/chat_template）
 
@@ -95,5 +95,5 @@ python -m src.models.grpo \
 - 增加 `gradient_accumulation` 代替直接增大 batch。
 
 ### 3) 模型输出格式不稳定
-- 检查训练与推理是否使用统一 prompt 构造（`src/data/prompting.py`）。
+- 检查训练与推理是否使用统一 prompt 构造（`src/data_gen/prompting.py`）。
 - 检查训练样本末尾是否稳定为合法动作字符。

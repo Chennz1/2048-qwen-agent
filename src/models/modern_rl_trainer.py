@@ -33,7 +33,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from datasets import Dataset
 
 from src.envs.game_2048 import Game2048, parse_action_from_text, ACTION_MAP
-from src.data.prompting import build_messages, format_inference_prompt, format_sample_text
+from src.data_gen.prompting import build_messages, format_inference_prompt, format_sample_text
 from src.utils.monitoring import IterationMonitor, normalize_monitor_backend, report_to_list
 
 try:
@@ -567,7 +567,7 @@ class ReSTTrainer:
             gradient_accumulation_steps=4,
             learning_rate=self.config.learning_rate,
             warmup_ratio=0.1,
-            logging_steps=10,
+            logging_steps=4,
             save_strategy="no",
             fp16=True,
             gradient_checkpointing=True,

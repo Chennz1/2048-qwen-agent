@@ -14,6 +14,7 @@ import ast
 import json
 import os
 import inspect
+import re
 import types
 from importlib.metadata import PackageNotFoundError, version
 from dataclasses import dataclass
@@ -29,9 +30,32 @@ os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
 from transformers import AutoTokenizer
 
-from src.data.prompting import format_inference_prompt
-from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_text
+from src.data_gen.prompting import format_inference_prompt
+from src.envs.game_2048 import ACTION_MAP, Game2048
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
+
+
+_TRAILING_TEMPLATE_TOKEN_RE = re.compile(
+    r"(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+\s*$"
+)
+_LEADING_TEMPLATE_TOKEN_RE = re.compile(
+    r"^(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+"
+)
+_STRICT_ACTION_OUTPUT_RE = re.compile(
+    r"^\s*(?:<think>[\s\S]*?</think>\s*)?([上右下左])\s*$"
+)
+_ACTION_CHAR_HINT_RE = re.compile(r"(?:动作|action)\s*[:：]?\s*([上右下左])", flags=re.I)
+_ACTION_ID_HINT_RE = re.compile(r"(?:动作|action)\s*[:：]?\s*([0-3])", flags=re.I)
+_TRAILING_ACTION_CHAR_RE = re.compile(r"([上右下左])\s*$")
+_TRAILING_ACTION_ID_RE = re.compile(r"([0-3])\s*$")
+_ACTION_WORD_RE = re.compile(r"\b(up|right|down|left)\b", flags=re.I)
+_ACTION_CHAR_TO_ID = {v: k for k, v in ACTION_MAP.items()}
+_ACTION_WORD_TO_ID = {
+    "up": 0,
+    "right": 1,
+    "down": 2,
+    "left": 3,
+}
 
 
 def _load_trl_grpo_symbols():
@@ -107,6 +131,10 @@ def _build_grpo_config(
     GRPOConfig: Any,
     output_dir: str,
     learning_rate: float,
+    warmup_ratio: float,
+    lr_scheduler_type: str,
+    clip_eps: float,
+    kl_beta: float,
     num_train_epochs: int,
     batch_size: int,
     gradient_accumulation_steps: int,
@@ -123,6 +151,8 @@ def _build_grpo_config(
     kwargs: Dict[str, Any] = {
         "output_dir": output_dir,
         "learning_rate": learning_rate,
+        "warmup_ratio": warmup_ratio,
+        "lr_scheduler_type": lr_scheduler_type,
         "num_train_epochs": num_train_epochs,
         "per_device_train_batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -130,8 +160,19 @@ def _build_grpo_config(
         "max_prompt_length": max_prompt_length,
         "max_completion_length": max_completion_length,
         "save_steps": save_steps,
+        "disable_tqdm": True,
         "logging_steps": logging_steps,
         "report_to": report_to,
+        "use_vllm": True,
+        "vllm_mode": "colocate",
+        "vllm_gpu_memory_utilization" : 0.3,
+        # Keep these aliases for TRL version compatibility.
+        "epsilon": clip_eps,
+        "clip_range": clip_eps,
+        "cliprange": clip_eps,
+        "beta": kl_beta,
+        "kl_coef": kl_beta,
+        "kl_beta": kl_beta,
     }
 
     # Length args vary across TRL versions. Provide fallbacks when canonical
@@ -190,7 +231,7 @@ def _resolve_grpo_model_input(model_name_or_path: str) -> Any:
 class GRPO2048DataConfig:
     """Prompt dataset config for GRPO."""
 
-    source: str = "raw"  # raw | processed
+    source: str = "raw"  # raw only
     input_dir: str = "data/raw"
     num_samples: int = 5000
     min_score: int = 0
@@ -201,15 +242,15 @@ class GRPO2048DataConfig:
 class ExpertRewardConfig:
     """Config for expert-shaped GRPO reward."""
 
-    reward_mode: str = "expert_shaped"  # simple | expert_shaped
-    illegal_penalty: float = -5.0
-    legal_bonus: float = 0.2
+    format_penalty: float = -0.6
+    illegal_penalty: float = -1.2
+    legal_bonus: float = 0.45
     score_norm: float = 64.0
     potential_norm: float = 5.0
-    w_score: float = 0.15
-    w_potential: float = 0.35
-    w_expert: float = 0.40
-    w_risk: float = 0.10
+    w_score: float = 0.20
+    w_potential: float = 0.25
+    w_expert: float = 0.35
+    w_risk: float = 0.08
     expert_depth: int = 2
     expert_max_empty: int = 8
 
@@ -226,12 +267,9 @@ class GRPO2048DatasetBuilder:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def build(self, cfg: GRPO2048DataConfig) -> Dataset:
-        if cfg.source == "raw":
-            rows = self._from_raw(Path(cfg.input_dir), cfg.min_score)
-        elif cfg.source == "processed":
-            rows = self._from_processed(Path(cfg.input_dir))
-        else:
-            raise ValueError(f"Unsupported source: {cfg.source}")
+        if cfg.source != "raw":
+            raise ValueError(f"Unsupported source: {cfg.source}. GRPO now supports raw only.")
+        rows = self._from_raw(Path(cfg.input_dir), cfg.min_score)
 
         if not rows:
             raise ValueError("No samples available for GRPO dataset")
@@ -273,24 +311,6 @@ class GRPO2048DatasetBuilder:
                         "target_action": state_item.get("action", "上"),
                     }
                 )
-
-        return rows
-
-    def _from_processed(self, input_dir: Path) -> List[Dict[str, Any]]:
-        ds = Dataset.load_from_disk(str(input_dir))
-        rows: List[Dict[str, Any]] = []
-
-        for item in ds:
-            text = item["text"]
-            # Fallback path: already templated text; no state metadata => weak reward.
-            rows.append(
-                {
-                    "prompt": text,
-                    "state_text": "",
-                    "valid_actions": [],
-                    "target_action": "上",
-                }
-            )
 
         return rows
 
@@ -564,46 +584,6 @@ class GRPO2048Rewards:
             max_empty_branches=cfg.expert_max_empty,
         )
 
-    @staticmethod
-    def action_validity(completions: List[Any], **kwargs) -> List[float]:
-        valid_actions_col = kwargs.get("valid_actions")
-        rewards: List[float] = []
-
-        for i, completion in enumerate(completions):
-            text = _completion_to_text(completion)
-            action_id = parse_action_from_text(text)
-
-            valid_actions = _coerce_valid_actions(valid_actions_col[i] if valid_actions_col else None)
-            if valid_actions:
-                rewards.append(1.0 if action_id in valid_actions else -1.0)
-            else:
-                # Weak fallback when metadata is unavailable.
-                rewards.append(0.0)
-
-        return rewards
-
-    @staticmethod
-    def one_step_gain(completions: List[Any], **kwargs) -> List[float]:
-        state_col = kwargs.get("state_text")
-        rewards: List[float] = []
-
-        for i, completion in enumerate(completions):
-            text = _completion_to_text(completion)
-            action_id = parse_action_from_text(text)
-
-            state_text = state_col[i] if state_col else ""
-            game = _game_from_state_text(state_text)
-            if game is None:
-                rewards.append(0.0)
-                continue
-
-            prev_score = game.score
-            _, _, _, score = game.step(action_id)
-            score_gain = score - prev_score
-            rewards.append(float(score_gain))
-
-        return rewards
-
     @classmethod
     def expert_shaped(cls, completions: List[Any], **kwargs) -> List[float]:
         state_col = kwargs.get("state_text")
@@ -612,7 +592,10 @@ class GRPO2048Rewards:
 
         for i, completion in enumerate(completions):
             text = _completion_to_text(completion)
-            action_id = parse_action_from_text(text)
+            action_id = _parse_action_id(text)
+            if action_id is None:
+                rewards.append(float(cls._cfg.format_penalty))
+                continue
 
             state_text = state_col[i] if state_col else ""
             game = _game_from_state_text(state_text)
@@ -632,16 +615,18 @@ class GRPO2048Rewards:
                 continue
 
             prev_grid = np.array(game.grid, copy=True)
-            prev_score = game.score
             prev_empty = int(np.sum(prev_grid == 0))
             prev_mobility = len(valid_actions)
             prev_corner_locked = cls._potential_model.max_tile_in_corner(prev_grid)
             prev_potential = cls._potential_model.score(prev_grid, valid_actions)
 
-            _, _, _, score = game.step(action_id)
-            score_gain = float(score - prev_score)
-            next_grid = np.array(game.grid, copy=True)
-            next_valid_actions = game.get_valid_actions()
+            # Use deterministic transition (move without random tile spawn) to keep reward stable.
+            next_grid, moved, score_gain = cls._expert_scorer._simulate_move(prev_grid, int(action_id))
+            if not moved:
+                rewards.append(float(cls._cfg.illegal_penalty))
+                continue
+            score_gain = float(score_gain)
+            next_valid_actions = cls._expert_scorer._valid_actions(next_grid)
             next_potential = cls._potential_model.score(next_grid, next_valid_actions)
 
             score_term = float(np.tanh(score_gain / max(cls._cfg.score_norm, 1e-6)))
@@ -669,26 +654,37 @@ class GRPO2048Rewards:
         return rewards
 
     @classmethod
-    def get_reward_funcs(cls, reward_mode: str) -> List[Any]:
-        if reward_mode == "simple":
-            return [cls.action_validity, cls.one_step_gain]
+    def get_reward_funcs(cls) -> List[Any]:
         return [cls.expert_shaped]
 
     @classmethod
     def _expert_term(cls, grid: np.ndarray, valid_actions: List[int], action_id: int) -> float:
         values = cls._expert_scorer.action_values(grid, valid_actions)
         if action_id not in values or not values:
-            return -1.0
+            return 0.0
 
         arr = np.array([values[a] for a in valid_actions if a in values], dtype=float)
-        if arr.size <= 1:
-            return 0.0
-        std = float(arr.std())
-        if std < 1e-6:
+        if arr.size == 0:
             return 0.0
 
-        z = (values[action_id] - float(arr.mean())) / std
-        return float(np.tanh(z))
+        best = float(arr.max())
+        worst = float(arr.min())
+        span = best - worst
+        if span < 1e-6:
+            return 0.5
+
+        val = float(values[action_id])
+        percentile = (val - worst) / span  # [0, 1]
+
+        std = float(arr.std())
+        if std < 1e-6:
+            confidence = percentile
+        else:
+            z = (val - float(arr.mean())) / std
+            confidence = 0.5 * (float(np.tanh(z)) + 1.0)  # [0, 1]
+
+        aligned = 0.7 * percentile + 0.3 * confidence
+        return float(np.clip(aligned, 0.0, 1.0))
 
     @classmethod
     def _risk_term(
@@ -705,24 +701,24 @@ class GRPO2048Rewards:
 
         risk = 0.0
         if next_empty <= 1:
-            risk -= 1.0
+            risk -= 0.5
         elif next_empty <= 2:
-            risk -= 0.6
+            risk -= 0.25
 
         if next_mobility <= 1:
-            risk -= 1.0
+            risk -= 0.5
         elif next_mobility == 2:
-            risk -= 0.4
+            risk -= 0.2
 
         if prev_corner_locked and not next_corner_locked:
-            risk -= 0.8
+            risk -= 0.3
 
         if next_empty >= 5 and next_mobility >= 3:
             risk += 0.3
         if next_empty > prev_empty and next_mobility >= prev_mobility:
             risk += 0.2
 
-        return float(np.clip(risk, -2.0, 1.0))
+        return float(np.clip(risk, -1.0, 1.0))
 
 
 class TRLGRPO2048Trainer:
@@ -745,7 +741,12 @@ class TRLGRPO2048Trainer:
     def train(
         self,
         dataset: Dataset,
-        learning_rate: float = 1e-6,
+        tokenizer: Optional[Any] = None,
+        learning_rate: float = 5e-6,
+        warmup_ratio: float = 0.03,
+        lr_scheduler_type: str = "cosine",
+        clip_eps: float = 0.28,
+        kl_beta: float = 0.0,
         num_train_epochs: int = 1,
         batch_size: int = 2,
         gradient_accumulation_steps: int = 4,
@@ -753,8 +754,7 @@ class TRLGRPO2048Trainer:
         max_prompt_length: int = 1024,
         max_completion_length: int = 128,
         save_steps: int = 200,
-        logging_steps: int = 10,
-        reward_mode: str = "expert_shaped",
+        logging_steps: int = 4,
     ):
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
 
@@ -764,6 +764,10 @@ class TRLGRPO2048Trainer:
             GRPOConfig=GRPOConfig,
             output_dir=self.output_dir,
             learning_rate=learning_rate,
+            warmup_ratio=warmup_ratio,
+            lr_scheduler_type=lr_scheduler_type,
+            clip_eps=clip_eps,
+            kl_beta=kl_beta,
             num_train_epochs=num_train_epochs,
             batch_size=batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -775,15 +779,22 @@ class TRLGRPO2048Trainer:
             report_to=report_to,
         )
 
-        reward_funcs = GRPO2048Rewards.get_reward_funcs(reward_mode=reward_mode)
+        reward_funcs = GRPO2048Rewards.get_reward_funcs()
         model_input = _resolve_grpo_model_input(self.model_name_or_path)
+        trainer_params = set(inspect.signature(GRPOTrainer.__init__).parameters.keys())
+        trainer_kwargs: Dict[str, Any] = {
+            "model": model_input,
+            "reward_funcs": reward_funcs,
+            "args": cfg,
+            "train_dataset": dataset,
+        }
+        if tokenizer is not None:
+            if "processing_class" in trainer_params:
+                trainer_kwargs["processing_class"] = tokenizer
+            elif "tokenizer" in trainer_params:
+                trainer_kwargs["tokenizer"] = tokenizer
 
-        trainer = GRPOTrainer(
-            model=model_input,
-            reward_funcs=reward_funcs,
-            args=cfg,
-            train_dataset=dataset,
-        )
+        trainer = GRPOTrainer(**trainer_kwargs)
 
         trainer.train()
         trainer.save_model(self.output_dir)
@@ -793,7 +804,7 @@ class TRLGRPO2048Trainer:
             "trainer": "trl_grpo",
             "model_name_or_path": self.model_name_or_path,
             "num_train_samples": len(dataset),
-            "reward_mode": reward_mode,
+            "reward_mode": "expert_shaped",
             "reward_config": vars(GRPO2048Rewards._cfg),
         }
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -801,6 +812,67 @@ class TRLGRPO2048Trainer:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
         return trainer
+
+
+def _normalize_completion_text(text: str) -> str:
+    normalized = text.rstrip()
+    while True:
+        stripped = _TRAILING_TEMPLATE_TOKEN_RE.sub("", normalized)
+        if stripped == normalized:
+            break
+        normalized = stripped.rstrip()
+    while True:
+        stripped = _LEADING_TEMPLATE_TOKEN_RE.sub("", normalized)
+        if stripped == normalized:
+            break
+        normalized = stripped.lstrip()
+    return normalized
+
+
+def _parse_strict_action_id(text: str) -> Optional[int]:
+    """Parse action from strict output: `动作` or `<think>...</think> + 动作`."""
+    normalized = _normalize_completion_text(text)
+    match = _STRICT_ACTION_OUTPUT_RE.fullmatch(normalized)
+    if not match:
+        return None
+    return _ACTION_CHAR_TO_ID.get(match.group(1))
+
+
+def _parse_action_id(text: str) -> Optional[int]:
+    """Parse action with strict-first and robust fallbacks."""
+    normalized = _normalize_completion_text(text)
+
+    strict = _parse_strict_action_id(normalized)
+    if strict is not None:
+        return strict
+
+    hinted_char = _ACTION_CHAR_HINT_RE.search(normalized)
+    if hinted_char:
+        return _ACTION_CHAR_TO_ID.get(hinted_char.group(1))
+
+    hinted_id = _ACTION_ID_HINT_RE.search(normalized)
+    if hinted_id:
+        return int(hinted_id.group(1))
+
+    tail_char = _TRAILING_ACTION_CHAR_RE.search(normalized)
+    if tail_char:
+        return _ACTION_CHAR_TO_ID.get(tail_char.group(1))
+
+    tail_id = _TRAILING_ACTION_ID_RE.search(normalized)
+    if tail_id:
+        return int(tail_id.group(1))
+
+    words = _ACTION_WORD_RE.findall(normalized)
+    if words:
+        return _ACTION_WORD_TO_ID.get(words[-1].lower())
+
+    # Last-resort recovery: if model outputs multiple directions in analysis text,
+    # prefer the final one as the final decision token.
+    chars = [ch for ch in normalized if ch in _ACTION_CHAR_TO_ID]
+    if chars:
+        return _ACTION_CHAR_TO_ID.get(chars[-1])
+
+    return None
 
 
 def _completion_to_text(completion: Any) -> str:
@@ -875,7 +947,7 @@ def main():
     parser.add_argument("--base_model", type=str, default=None, help="Alias of --model")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/grpo")
 
-    parser.add_argument("--data_source", type=str, default="raw", choices=["raw", "processed"])
+    parser.add_argument("--data_source", type=str, default="raw", choices=["raw"])
     parser.add_argument("--input_dir", type=str, default="data/raw")
     parser.add_argument("--num_samples", type=int, default=1200)
     parser.add_argument("--min_score", type=int, default=0)
@@ -890,26 +962,31 @@ def main():
         default=2,
         help="GRPO每个prompt采样条数(K)。要求 global_train_batch_size 可被该值整除。",
     )
-    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
+    parser.add_argument("--clip_eps", type=float, default=0.28)
+    parser.add_argument("--kl_beta", type=float, default=0.0)
     parser.add_argument("--max_prompt_length", type=int, default=512)
-    parser.add_argument("--max_completion_length", type=int, default=128)
-    parser.add_argument("--save_steps", type=int, default=200)
-    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--max_completion_length", type=int, default=768)
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument(
         "--reward_mode",
         type=str,
         default="expert_shaped",
-        choices=["simple", "expert_shaped"],
-        help="GRPO reward mode",
+        choices=["expert_shaped"],
+        help="GRPO reward mode (expert_shaped only)",
     )
-    parser.add_argument("--reward_illegal_penalty", type=float, default=-5.0)
-    parser.add_argument("--reward_legal_bonus", type=float, default=0.2)
+    parser.add_argument("--reward_format_penalty", type=float, default=-0.6)
+    parser.add_argument("--reward_illegal_penalty", type=float, default=-1.2)
+    parser.add_argument("--reward_legal_bonus", type=float, default=0.45)
     parser.add_argument("--reward_score_norm", type=float, default=64.0)
     parser.add_argument("--reward_potential_norm", type=float, default=5.0)
-    parser.add_argument("--reward_w_score", type=float, default=0.15)
-    parser.add_argument("--reward_w_potential", type=float, default=0.35)
-    parser.add_argument("--reward_w_expert", type=float, default=0.40)
-    parser.add_argument("--reward_w_risk", type=float, default=0.10)
+    parser.add_argument("--reward_w_score", type=float, default=0.20)
+    parser.add_argument("--reward_w_potential", type=float, default=0.25)
+    parser.add_argument("--reward_w_expert", type=float, default=0.35)
+    parser.add_argument("--reward_w_risk", type=float, default=0.08)
     parser.add_argument("--reward_expert_depth", type=int, default=2)
     parser.add_argument("--reward_expert_max_empty", type=int, default=8)
 
@@ -979,7 +1056,7 @@ def main():
     )
 
     reward_cfg = ExpertRewardConfig(
-        reward_mode=args.reward_mode,
+        format_penalty=args.reward_format_penalty,
         illegal_penalty=args.reward_illegal_penalty,
         legal_bonus=args.reward_legal_bonus,
         score_norm=args.reward_score_norm,
@@ -995,7 +1072,12 @@ def main():
 
     trainer.train(
         dataset=train_dataset,
+        tokenizer=builder.tokenizer,
         learning_rate=args.lr,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
+        clip_eps=args.clip_eps,
+        kl_beta=args.kl_beta,
         num_train_epochs=args.epochs,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
@@ -1004,7 +1086,6 @@ def main():
         max_completion_length=args.max_completion_length,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
-        reward_mode=args.reward_mode,
     )
 
 

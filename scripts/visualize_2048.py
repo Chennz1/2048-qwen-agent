@@ -35,7 +35,7 @@ sys.path.insert(0, str(project_root))
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.envs.game_2048 import Game2048, parse_action_from_text
-from src.data.generator import ThinkingHeuristicPlayer
+from src.data_gen.generator import ThinkingHeuristicPlayer
 
 # 尝试导入优化库
 try:
@@ -391,7 +391,7 @@ class Game2048Visualizer:
             top_p=sampling["top_p"],
             top_k=sampling["top_k"],
             min_p=sampling["min_p"],
-            max_tokens=256 if self.use_thinking else 64,
+            max_tokens=768 if self.use_thinking else 64,
             presence_penalty=self.presence_penalty,
         )
 
@@ -419,7 +419,7 @@ class Game2048Visualizer:
         with torch.no_grad():
             generate_kwargs = {
                 **inputs,
-                "max_new_tokens": 256 if self.use_thinking else 64,
+                "max_new_tokens": 768 if self.use_thinking else 64,
                 "temperature": sampling["temperature"],
                 "top_p": sampling["top_p"],
                 "top_k": sampling["top_k"],

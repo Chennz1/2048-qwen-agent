@@ -25,7 +25,7 @@ set -e
 
 echo "=== Generating 100% Expert CoT Data ==="
 
-NUM_GAMES=10000
+NUM_GAMES=1
 OUTPUT_DIR="data/raw_expert"
 SEED=42
 EXPERT_DEPTH=2
@@ -62,7 +62,7 @@ echo "  expert_max_empty: $EXPERT_MAX_EMPTY"
 echo "  enable_diversity: $ENABLE_DIVERSITY"
 echo ""
 
-python -m src.data.generator \
+python -m src.data_gen.generator \
   --num_games "$NUM_GAMES" \
   --difficulty expert \
   --with_thinking \

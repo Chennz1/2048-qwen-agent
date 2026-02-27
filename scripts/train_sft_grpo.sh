@@ -51,38 +51,38 @@ echo ""
 # 配置
 BASE_MODEL="Qwen/Qwen3-1.7B"
 # 数据策略：默认使用 expert CoT 数据
-NUM_GAMES=100
+NUM_GAMES=50
 RAW_DIR="data/raw_expert"
 PROCESSED_DIR="data/processed_expert"
-SFT_TRAIN_SAMPLES=3000
+SFT_TRAIN_SAMPLES=640
 SFT_SUBSET_SEED=42
-SFT_TRAIN_DIR="data/processed_expert_sft1k/train"
+SFT_TRAIN_DIR="data/processed_expert_sft10k/train"
 EXPERT_DEPTH=2
 EXPERT_MAX_EMPTY=8
 
 SFT_EPOCHS=1
-SFT_BATCH_SIZE=1
-SFT_GRAD_ACCUM=8
+SFT_BATCH_SIZE=16
+SFT_GRAD_ACCUM=1
 SFT_OUTPUT="./checkpoints/sft"
 
 # GRPO配置（TRL GRPOTrainer）
 GRPO_EPOCHS=1
-GRPO_NUM_SAMPLES=7200
-GRPO_BATCH_SIZE=2
-GRPO_GRAD_ACCUM=8
-GRPO_NUM_GENERATIONS=2
+GRPO_NUM_SAMPLES=4096
+GRPO_BATCH_SIZE=8
+GRPO_GRAD_ACCUM=4
+GRPO_NUM_GENERATIONS=8
 GRPO_MAX_PROMPT_LENGTH=512
-GRPO_MAX_COMPLETION_LENGTH=128
+GRPO_MAX_COMPLETION_LENGTH=512
 GRPO_OUTPUT="./checkpoints/grpo"
 
-EVAL_GAMES=5
+EVAL_GAMES=32
 
 # 优化选项（11GB 友好默认）
 USE_UNSLOTH=false
 LOAD_IN_4BIT=true
 USE_FLASH_ATTN=false
-USE_VLLM=false
-VLLM_QUANT="int8"
+USE_VLLM=true
+VLLM_QUANT=""
 MONITOR_BACKEND="wandb"
 
 # 解析优化参数
@@ -138,7 +138,7 @@ if [ ! -d "$PROCESSED_DIR/train" ]; then
         --expert_depth "$EXPERT_DEPTH" \
         --expert_max_empty "$EXPERT_MAX_EMPTY" \
         --output_dir "$RAW_DIR"
-    python -m src.data.processor \
+    python -m src.data_gen.processor \
         --input_dir "$RAW_DIR" \
         --output_dir "$PROCESSED_DIR" \
         --use_thinking \
@@ -258,10 +258,10 @@ except Exception:
         )
 PY
 
+# GRPO 训练固定从 raw 轨迹在线构造 prompt-only 数据集。
 python -m src.models.grpo \
     --model "$SFT_OUTPUT" \
     --output_dir "$GRPO_OUTPUT" \
-    --data_source raw \
     --input_dir "$RAW_DIR" \
     --num_samples "$GRPO_NUM_SAMPLES" \
     --epochs "$GRPO_EPOCHS" \

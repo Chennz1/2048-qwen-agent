@@ -18,13 +18,13 @@ from typing import Dict, List, Optional
 import json
 
 from src.envs.game_2048 import Game2048, ACTION_MAP, parse_action_from_text
-from src.data.prompting import format_inference_prompt
+from src.data_gen.prompting import format_inference_prompt
 
 # Hugging Face mirror defaults (honor existing env if user already set it).
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 try:
     from peft import PeftModel
     PEFT_AVAILABLE = True
@@ -74,7 +74,7 @@ class Game2048Evaluator:
         presence_penalty: float = 0.0,
         # 优化选项 (默认开启)
         use_vllm: bool = True,
-        vllm_quantization: Optional[str] = "int8",  # "int8", "awq", "gptq"
+        vllm_quantization: Optional[str] = None,
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
     ):
@@ -89,7 +89,7 @@ class Game2048Evaluator:
             use_thinking: Whether to enable thinking mode prompt/template
             presence_penalty: Presence penalty for supported frameworks (0~2)
             use_vllm: Use vLLM for fast inference (10-50x speedup)
-            vllm_quantization: vLLM quantization method ("int8", "awq", "gptq")
+            vllm_quantization: vLLM quantization method (None means disable quantization)
             load_in_4bit: Use 4-bit quantization (standard loading)
             load_in_8bit: Use 8-bit quantization (standard loading)
         """
@@ -99,6 +99,12 @@ class Game2048Evaluator:
         self.vllm_model = None
         self.vllm_lora_request = None
         self.model_type = "base_model" if is_base_model or model_path is None else "finetuned"
+
+        # Evaluation policy: prefer BF16, avoid bitsandbytes quantization by default.
+        if load_in_4bit or load_in_8bit:
+            print("⚠️ 已忽略 load_in_4bit/load_in_8bit：评测默认使用 BF16，不使用 bitsandbytes 量化。")
+            load_in_4bit = False
+            load_in_8bit = False
 
         # 显示优化配置
         print("\n" + "=" * 70)
@@ -114,10 +120,7 @@ class Game2048Evaluator:
                 print("⚠️ vLLM未安装，回退到标准模式")
                 self.use_vllm = False
 
-        if not self.use_vllm and (load_in_4bit or load_in_8bit):
-            print(f"✅ {'4-bit' if load_in_4bit else '8-bit'} 量化: 启用")
-
-        if not use_vllm and not load_in_4bit and not load_in_8bit:
+        if not use_vllm:
             print("ℹ️ 使用标准评估模式")
 
         print("=" * 70)
@@ -154,6 +157,43 @@ class Game2048Evaluator:
             )
         return base_model
 
+    @staticmethod
+    def _resolve_lora_rank_from_adapter(adapter_path: str) -> Optional[int]:
+        """从 adapter_config.json 解析 LoRA rank (r)。"""
+        adapter_config_path = Path(adapter_path) / "adapter_config.json"
+        if not adapter_config_path.exists():
+            return None
+        try:
+            with open(adapter_config_path, "r", encoding="utf-8") as f:
+                adapter_config = json.load(f)
+        except Exception:
+            return None
+        rank = adapter_config.get("r")
+        if rank is None:
+            return None
+        try:
+            rank_i = int(rank)
+        except Exception:
+            return None
+        return rank_i if rank_i > 0 else None
+
+    @staticmethod
+    def _normalize_vllm_quantization(quantization: Optional[str]) -> Optional[str]:
+        """Normalize user-facing quantization aliases to vLLM-supported names."""
+        if not quantization:
+            return None
+        q = str(quantization).strip().lower()
+        alias = {
+            "int8": "bitsandbytes",
+            "bnb": "bitsandbytes",
+        }
+        return alias.get(q, q)
+
+    @staticmethod
+    def _ensure_vllm_multiproc_spawn() -> None:
+        """Avoid CUDA re-init crash in forked vLLM worker subprocesses."""
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
     def _init_vllm(
         self,
         model_path: str,
@@ -162,6 +202,7 @@ class Game2048Evaluator:
         quantization: Optional[str],
     ):
         """使用 vLLM 初始化模型"""
+        self._ensure_vllm_multiproc_spawn()
         model_ref = base_model
 
         if is_base_model or not model_path:
@@ -177,7 +218,7 @@ class Game2048Evaluator:
         llm_kwargs = {
             "model": model_ref,
             "gpu_memory_utilization": 0.9,
-            "max_model_len": 2048,
+            "max_model_len": 1024,
             "tensor_parallel_size": 1,
             "trust_remote_code": True,
         }
@@ -189,11 +230,34 @@ class Game2048Evaluator:
                     "Please upgrade vLLM for LoRA support, or disable --use_vllm."
                 )
             llm_kwargs["enable_lora"] = True
+            lora_rank = self._resolve_lora_rank_from_adapter(model_path)
+            if lora_rank is not None:
+                llm_kwargs["max_lora_rank"] = max(16, lora_rank)
+                print(f"   vLLM max_lora_rank={llm_kwargs['max_lora_rank']} (adapter r={lora_rank})")
 
-        if quantization:
-            llm_kwargs["quantization"] = quantization
+        normalized_quant = self._normalize_vllm_quantization(quantization)
+        if normalized_quant:
+            if normalized_quant != (quantization or "").lower():
+                print(f"   量化别名映射: {quantization} -> {normalized_quant}")
+            llm_kwargs["quantization"] = normalized_quant
 
-        self.vllm_model = LLM(**llm_kwargs)
+        try:
+            self.vllm_model = LLM(**llm_kwargs)
+        except Exception as exc:
+            if normalized_quant and "quantization" in str(exc).lower():
+                print(
+                    f"⚠️ vLLM quantization='{normalized_quant}' 初始化失败，"
+                    "回退到无量化 vLLM。"
+                )
+                llm_kwargs.pop("quantization", None)
+                self.vllm_model = LLM(**llm_kwargs)
+            elif "Cannot re-initialize CUDA in forked subprocess" in str(exc):
+                raise RuntimeError(
+                    "vLLM failed due to CUDA+fork multiprocessing. "
+                    "Set VLLM_WORKER_MULTIPROC_METHOD=spawn (or use --no_vllm)."
+                ) from exc
+            else:
+                raise
         self.tokenizer = self.vllm_model.get_tokenizer()
 
         if model_path and (not is_base_model) and self._is_lora_adapter_checkpoint(model_path):
@@ -201,6 +265,9 @@ class Game2048Evaluator:
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Decoder-only models should use left padding for batched generation.
+        if getattr(self.tokenizer, "padding_side", None) != "left":
+            self.tokenizer.padding_side = "left"
 
         print("✅ vLLM 模型加载成功\n")
 
@@ -235,27 +302,14 @@ class Game2048Evaluator:
             tokenizer_to_load = model_path
             need_lora = False
 
-        # 配置量化
-        bnb_config = None
-        if load_in_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-        elif load_in_8bit:
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-
         # Load base model
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         model_kwargs = {
-            "torch_dtype": torch.float16,
+            "torch_dtype": torch.bfloat16 if use_bf16 else torch.float16,
             "device_map": device,
             "trust_remote_code": True,
         }
-
-        if bnb_config:
-            model_kwargs["quantization_config"] = bnb_config
+        print(f"   推理精度: {'bf16' if use_bf16 else 'fp16'}")
 
         self.model = AutoModelForCausalLM.from_pretrained(model_to_load, **model_kwargs)
 
@@ -283,6 +337,9 @@ class Game2048Evaluator:
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Decoder-only models should use left padding for batched generation.
+        if getattr(self.tokenizer, "padding_side", None) != "left":
+            self.tokenizer.padding_side = "left"
 
         self.model.eval()
         print("✅ 模型加载成功\n")
@@ -314,17 +371,26 @@ class Game2048Evaluator:
         Returns:
             Action ID (0-3)
         """
-        if self.use_vllm:
-            return self._predict_action_vllm(state_text, temperature)
-        else:
-            return self._predict_action_standard(state_text, temperature)
+        return self.predict_actions([state_text], temperature=temperature)[0]
 
-    def _predict_action_vllm(
+    def predict_actions(
         self,
-        state_text: str,
+        state_texts: List[str],
+        temperature: Optional[float] = None,
+    ) -> List[int]:
+        """Predict actions for a batch of states."""
+        if not state_texts:
+            return []
+        if self.use_vllm:
+            return self._predict_actions_vllm(state_texts, temperature)
+        return self._predict_actions_standard(state_texts, temperature)
+
+    def _predict_actions_vllm(
+        self,
+        state_texts: List[str],
         temperature: Optional[float],
-    ) -> int:
-        """使用 vLLM 预测动作
+    ) -> List[int]:
+        """使用 vLLM 批量预测动作
 
         使用与训练数据相同的 prompt 格式，确保一致性。
         官方最佳实践：
@@ -333,11 +399,14 @@ class Game2048Evaluator:
         - 禁止贪心解码
         """
         sampling = self._resolve_sampling(temperature)
-        prompt = format_inference_prompt(
-            tokenizer=self.tokenizer,
-            state_text=state_text,
-            use_thinking=self.use_thinking,
-        )
+        prompts = [
+            format_inference_prompt(
+                tokenizer=self.tokenizer,
+                state_text=state_text,
+                use_thinking=self.use_thinking,
+            )
+            for state_text in state_texts
+        ]
 
         # vLLM 批量推理 - 使用最佳实践参数
         sampling_params = SamplingParams(
@@ -345,30 +414,32 @@ class Game2048Evaluator:
             top_p=sampling["top_p"],
             top_k=sampling["top_k"],
             min_p=sampling["min_p"],
-            max_tokens=256 if self.use_thinking else 64,
+            max_tokens=512 if self.use_thinking else 64,
             presence_penalty=self.presence_penalty,
         )
 
         if self.vllm_lora_request is not None:
             outputs = self.vllm_model.generate(
-                [prompt],
+                prompts,
                 sampling_params,
                 lora_request=self.vllm_lora_request,
+                use_tqdm=False,
             )
         else:
-            outputs = self.vllm_model.generate([prompt], sampling_params)
-        response = outputs[0].outputs[0].text
+            outputs = self.vllm_model.generate(prompts, sampling_params, use_tqdm=False)
 
-        # Parse action
-        action = parse_action_from_text(response)
-        return action
+        actions: List[int] = []
+        for out in outputs:
+            text = out.outputs[0].text if out.outputs else ""
+            actions.append(parse_action_from_text(text))
+        return actions
 
-    def _predict_action_standard(
+    def _predict_actions_standard(
         self,
-        state_text: str,
+        state_texts: List[str],
         temperature: Optional[float],
-    ) -> int:
-        """使用标准方式预测动作
+    ) -> List[int]:
+        """使用标准方式批量预测动作
 
         使用与训练数据相同的 prompt 格式，确保一致性。
         官方最佳实践：
@@ -377,17 +448,21 @@ class Game2048Evaluator:
         - 禁止贪心解码
         """
         sampling = self._resolve_sampling(temperature)
-        prompt = format_inference_prompt(
-            tokenizer=self.tokenizer,
-            state_text=state_text,
-            use_thinking=self.use_thinking,
-        )
+        prompts = [
+            format_inference_prompt(
+                tokenizer=self.tokenizer,
+                state_text=state_text,
+                use_thinking=self.use_thinking,
+            )
+            for state_text in state_texts
+        ]
 
         inputs = self.tokenizer(
-            prompt,
+            prompts,
             return_tensors="pt",
             truncation=True,
-            max_length=512
+            max_length=512,
+            padding=True,
         )
 
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
@@ -395,7 +470,7 @@ class Game2048Evaluator:
         with torch.no_grad():
             generate_kwargs = {
                 **inputs,
-                "max_new_tokens": 256 if self.use_thinking else 64,
+                "max_new_tokens": 768 if self.use_thinking else 64,
                 "temperature": sampling["temperature"],
                 "top_p": sampling["top_p"],
                 "top_k": sampling["top_k"],
@@ -412,16 +487,16 @@ class Game2048Evaluator:
                 generate_kwargs["min_p"] = sampling["min_p"]
             outputs = self.model.generate(**generate_kwargs)
 
-        # Decode only the generated part
-        response = self.tokenizer.decode(
-            outputs[0][inputs['input_ids'].shape[1]:],
-            skip_special_tokens=True
-        )
+        prompt_len = inputs["input_ids"].shape[1]
+        actions: List[int] = []
+        for seq in outputs:
+            response = self.tokenizer.decode(
+                seq[prompt_len:],
+                skip_special_tokens=True,
+            )
+            actions.append(parse_action_from_text(response))
 
-        # Parse action
-        action = parse_action_from_text(response)
-
-        return action
+        return actions
 
     def evaluate(
         self,
@@ -429,6 +504,7 @@ class Game2048Evaluator:
         max_steps: int = 1000,
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
+        batch_size: int = 1,
         verbose: bool = True
     ) -> Dict:
         """
@@ -439,6 +515,7 @@ class Game2048Evaluator:
             max_steps: Maximum steps per game
             temperature: Sampling temperature override (None means mode default)
             seed: Global random seed for reproducibility
+            batch_size: Number of parallel game states per forward pass
             verbose: Print progress
 
         Returns:
@@ -456,47 +533,61 @@ class Game2048Evaluator:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-        for game_idx in range(num_games):
-            game_seed = self._derive_episode_seed(seed, game_idx)
-            game = Game2048(seed=game_seed)
-            game.reset()
+        batch_size = max(1, int(batch_size))
+        completed = 0
 
-            total_moves = 0
-            legal_moves = 0
+        for start in range(0, num_games, batch_size):
+            end = min(start + batch_size, num_games)
+            records = []
+            for game_idx in range(start, end):
+                game_seed = self._derive_episode_seed(seed, game_idx)
+                game = Game2048(seed=game_seed)
+                game.reset()
+                records.append({
+                    "game": game,
+                    "game_idx": game_idx,
+                    "done": False,
+                    "total_moves": 0,
+                    "legal_moves": 0,
+                })
 
-            for step in range(max_steps):
-                state = game._get_state()
-
-                # Predict action
-                action = self.predict_action(state, temperature=temperature)
-
-                # Check if legal
-                valid_actions = game.get_valid_actions()
-                is_legal = action in valid_actions
-
-                if is_legal:
-                    legal_moves += 1
-                    _, _, done, score = game.step(action)
-                else:
-                    # Use a random valid action as penalty
-                    if valid_actions:
-                        _, _, done, score = game.step(valid_actions[0])
-                    else:
-                        done = True
-                        score = game.score
-
-                total_moves += 1
-
-                if done:
+            for _ in range(max_steps):
+                active_indices = [i for i, rec in enumerate(records) if not rec["done"]]
+                if not active_indices:
                     break
 
-            scores.append(game.score)
-            max_tiles.append(game.get_max_tile())
-            legal_move_ratios.append(legal_moves / total_moves if total_moves > 0 else 0)
-            steps_list.append(total_moves)
+                states = [records[i]["game"]._get_state() for i in active_indices]
+                actions = self.predict_actions(states, temperature=temperature)
 
-            if verbose and (game_idx + 1) % 10 == 0:
-                print(f"Completed {game_idx + 1}/{num_games} games")
+                for rec_idx, action in zip(active_indices, actions):
+                    rec = records[rec_idx]
+                    game = rec["game"]
+                    was_done = rec["done"]
+                    valid_actions = game.get_valid_actions()
+                    is_legal = action in valid_actions
+                    if is_legal:
+                        rec["legal_moves"] += 1
+                        _, _, done, _ = game.step(action)
+                    else:
+                        if valid_actions:
+                            _, _, done, _ = game.step(valid_actions[0])
+                        else:
+                            done = True
+                    rec["total_moves"] += 1
+                    rec["done"] = bool(done)
+                    if verbose and (not was_done) and rec["done"]:
+                        print(f"Game {rec['game_idx']} finished with score={game.score}")
+
+            for rec in records:
+                game = rec["game"]
+                total_moves = rec["total_moves"]
+                scores.append(game.score)
+                max_tiles.append(game.get_max_tile())
+                legal_move_ratios.append(rec["legal_moves"] / total_moves if total_moves > 0 else 0)
+                steps_list.append(total_moves)
+                completed += 1
+                if verbose and completed % 10 == 0:
+                    print(f"Completed {completed}/{num_games} games")
 
         results = {
             'num_games': num_games,
@@ -523,6 +614,7 @@ class Game2048Evaluator:
         max_steps: int = 1000,
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
+        batch_size: int = 1,
         verbose: bool = True
     ) -> Dict:
         """
@@ -551,42 +643,63 @@ class Game2048Evaluator:
         steps_list = []
         bucket_counter: Dict[str, int] = {}
 
-        for idx, sample in enumerate(samples):
-            game_seed = self._derive_episode_seed(seed, idx, sample)
-            game = self._init_game_from_sample(sample, seed=game_seed)
-            bucket = sample.get("bucket", "unknown")
-            bucket_counter[bucket] = bucket_counter.get(bucket, 0) + 1
+        batch_size = max(1, int(batch_size))
+        completed = 0
 
-            total_moves = 0
-            legal_moves = 0
+        for start in range(0, len(samples), batch_size):
+            batch_samples = samples[start: start + batch_size]
+            records = []
+            for local_idx, sample in enumerate(batch_samples):
+                idx = start + local_idx
+                game_seed = self._derive_episode_seed(seed, idx, sample)
+                game = self._init_game_from_sample(sample, seed=game_seed)
+                bucket = sample.get("bucket", "unknown")
+                bucket_counter[bucket] = bucket_counter.get(bucket, 0) + 1
+                records.append({
+                    "game": game,
+                    "game_idx": idx,
+                    "done": False,
+                    "total_moves": 0,
+                    "legal_moves": 0,
+                })
 
             for _ in range(max_steps):
-                state = game._get_state()
-                action = self.predict_action(state, temperature=temperature)
-
-                valid_actions = game.get_valid_actions()
-                is_legal = action in valid_actions
-
-                if is_legal:
-                    legal_moves += 1
-                    _, _, done, _ = game.step(action)
-                else:
-                    if valid_actions:
-                        _, _, done, _ = game.step(valid_actions[0])
-                    else:
-                        done = True
-
-                total_moves += 1
-                if done:
+                active_indices = [i for i, rec in enumerate(records) if not rec["done"]]
+                if not active_indices:
                     break
 
-            scores.append(game.score)
-            max_tiles.append(game.get_max_tile())
-            legal_move_ratios.append(legal_moves / total_moves if total_moves > 0 else 0)
-            steps_list.append(total_moves)
+                states = [records[i]["game"]._get_state() for i in active_indices]
+                actions = self.predict_actions(states, temperature=temperature)
 
-            if verbose and (idx + 1) % 20 == 0:
-                print(f"Completed {idx + 1}/{len(samples)} snapshots")
+                for rec_idx, action in zip(active_indices, actions):
+                    rec = records[rec_idx]
+                    game = rec["game"]
+                    was_done = rec["done"]
+                    valid_actions = game.get_valid_actions()
+                    is_legal = action in valid_actions
+                    if is_legal:
+                        rec["legal_moves"] += 1
+                        _, _, done, _ = game.step(action)
+                    else:
+                        if valid_actions:
+                            _, _, done, _ = game.step(valid_actions[0])
+                        else:
+                            done = True
+                    rec["total_moves"] += 1
+                    rec["done"] = bool(done)
+                    if verbose and (not was_done) and rec["done"]:
+                        print(f"Snapshot {rec['game_idx']} finished with score={game.score}")
+
+            for rec in records:
+                game = rec["game"]
+                total_moves = rec["total_moves"]
+                scores.append(game.score)
+                max_tiles.append(game.get_max_tile())
+                legal_move_ratios.append(rec["legal_moves"] / total_moves if total_moves > 0 else 0)
+                steps_list.append(total_moves)
+                completed += 1
+                if verbose and completed % 20 == 0:
+                    print(f"Completed {completed}/{len(samples)} snapshots")
 
         results = {
             'num_games': len(samples),
@@ -761,7 +874,7 @@ Examples:
   python -m src.eval.evaluator --model_path ./checkpoints/sft
 
   # 使用 vLLM 加速评估 (10-50x)
-  python -m src.eval.evaluator --model_path ./checkpoints/sft --use_vllm --vllm_quantization int8
+  python -m src.eval.evaluator --model_path ./checkpoints/sft --use_vllm --vllm_quantization bitsandbytes
 
   # 使用 4-bit 量化评估
   python -m src.eval.evaluator --model_path ./checkpoints/sft --load_in_4bit
@@ -782,6 +895,8 @@ Examples:
                         help='Number of games to evaluate (default: 100)')
     parser.add_argument('--max_steps', type=int, default=1000,
                         help='Maximum steps per game (default: 1000)')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Batch size for parallel inference (default: 1)')
     parser.add_argument('--temperature', type=float, default=None,
                         help='Sampling temperature override (default: thinking=0.6, non-thinking=0.7)')
     parser.add_argument('--presence_penalty', type=float, default=0.0,
@@ -804,9 +919,12 @@ Examples:
     # 优化选项
     parser.add_argument('--use_vllm', action='store_true',
                         help='使用 vLLM 加速评估 (10-50x)')
-    parser.add_argument('--vllm_quantization', type=str, default=None,
-                        choices=['int8', 'awq', 'gptq'],
-                        help='vLLM 量化方式')
+    parser.add_argument(
+        '--vllm_quantization',
+        type=str,
+        default=None,
+        help="vLLM 量化方式（如 bitsandbytes/awq/gptq；int8 会自动映射到 bitsandbytes）",
+    )
     parser.add_argument('--load_in_4bit', action='store_true',
                         help='使用 4-bit 量化')
     parser.add_argument('--load_in_8bit', action='store_true',
@@ -855,6 +973,7 @@ Examples:
         print(f"   Temperature: {args.temperature}")
     print(f"   use_thinking: {args.use_thinking}")
     print(f"   presence_penalty: {args.presence_penalty}")
+    print(f"   batch_size: {args.batch_size}")
     print(f"   Max steps: {args.max_steps}\n")
 
     if args.eval_set:
@@ -863,6 +982,7 @@ Examples:
             max_steps=args.max_steps,
             temperature=args.temperature,
             seed=args.seed,
+            batch_size=args.batch_size,
         )
     else:
         results = evaluator.evaluate(
@@ -870,6 +990,7 @@ Examples:
             max_steps=args.max_steps,
             temperature=args.temperature,
             seed=args.seed,
+            batch_size=args.batch_size,
         )
 
     # Add model type to results

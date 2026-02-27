@@ -67,7 +67,7 @@ bash scripts/generate_expert_cot_data.sh \
 当前项目没有独立 `scripts/process_data.sh`，这里使用项目标准命令:
 
 ```bash
-python -m src.data.processor \
+python -m src.data_gen.processor \
   --input_dir data/raw \
   --output_dir data/processed \
   --use_thinking \
@@ -157,7 +157,7 @@ bash scripts/ci_local.sh --skip-smoke
 ## 7) 常见问题
 
 1. `train.sh` 报找不到 `data/processed/train`
-   先执行 `python -m src.data.processor ...`，因为训练脚本读取的是 processed 数据。
+   先执行 `python -m src.data_gen.processor ...`，因为训练脚本读取的是 processed 数据。
 
 2. 显存不足
    降低 `--batch_size`，或在训练脚本中关闭/调整量化相关选项。
