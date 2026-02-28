@@ -50,22 +50,23 @@ class Game2048:
         self.game_over = False
         self.reset()
 
-    def reset(self) -> str:
-        """Reset the game and return initial state"""
+    def reset(self, initial_tiles: int = 2, prob_4: float = 0.1) -> str:
+        """Reset the game and return initial state."""
         self.grid = np.zeros((4, 4), dtype=int)
         self.score = 0
         self.game_over = False
-        self._add_new_tile()
-        self._add_new_tile()
+        initial_tiles = int(np.clip(int(initial_tiles), 1, 16))
+        prob_4 = float(np.clip(float(prob_4), 0.0, 1.0))
+        for _ in range(initial_tiles):
+            self._add_new_tile(prob_4=prob_4)
         return self._get_state()
 
-    def _add_new_tile(self) -> None:
-        """Add a new tile (2 or 4) to a random empty cell"""
+    def _add_new_tile(self, prob_4: float = 0.1) -> None:
+        """Add a new tile (2 or 4) to a random empty cell."""
         empty_cells = [(i, j) for i in range(4) for j in range(4) if self.grid[i, j] == 0]
         if empty_cells:
             i, j = random.choice(empty_cells)
-            # 90% chance of 2, 10% chance of 4
-            self.grid[i, j] = 2 if random.random() < 0.9 else 4
+            self.grid[i, j] = 4 if random.random() < prob_4 else 2
 
     def step(self, action: int) -> Tuple[str, float, bool, int]:
         """

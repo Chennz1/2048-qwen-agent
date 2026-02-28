@@ -17,7 +17,6 @@
 #   --no_flash_attn                禁用 Flash Attention（默认本就关闭）
 #   --use_vllm                     评测阶段启用 vLLM（默认关闭，11GB更稳）
 #   --no_vllm                      评测阶段禁用 vLLM
-#
 # 说明:
 #   默认配置优先保证 11GB 显存可跑通 SFT+GRPO，而不是追求速度或最佳效果。
 #   且采用“轻SFT + 重RL”策略：
@@ -51,10 +50,10 @@ echo ""
 # 配置
 BASE_MODEL="Qwen/Qwen3-1.7B"
 # 数据策略：默认使用 expert CoT 数据
-NUM_GAMES=50
+NUM_GAMES=100
 RAW_DIR="data/raw_expert"
 PROCESSED_DIR="data/processed_expert"
-SFT_TRAIN_SAMPLES=640
+SFT_TRAIN_SAMPLES=4096
 SFT_SUBSET_SEED=42
 SFT_TRAIN_DIR="data/processed_expert_sft10k/train"
 EXPERT_DEPTH=2
@@ -62,15 +61,15 @@ EXPERT_MAX_EMPTY=8
 
 SFT_EPOCHS=1
 SFT_BATCH_SIZE=16
-SFT_GRAD_ACCUM=1
+SFT_GRAD_ACCUM=4
 SFT_OUTPUT="./checkpoints/sft"
 
 # GRPO配置（TRL GRPOTrainer）
 GRPO_EPOCHS=1
-GRPO_NUM_SAMPLES=4096
+GRPO_NUM_SAMPLES=8192
 GRPO_BATCH_SIZE=8
 GRPO_GRAD_ACCUM=4
-GRPO_NUM_GENERATIONS=8
+GRPO_NUM_GENERATIONS=4
 GRPO_MAX_PROMPT_LENGTH=512
 GRPO_MAX_COMPLETION_LENGTH=512
 GRPO_OUTPUT="./checkpoints/grpo"
@@ -193,7 +192,6 @@ if [ ! -d "$SFT_OUTPUT" ]; then
         --mode sft \
         --model "$BASE_MODEL" \
         --train_data "$SFT_TRAIN_DIR" \
-        --val_data "$PROCESSED_DIR/val" \
         --output_dir "$SFT_OUTPUT" \
         --epochs "$SFT_EPOCHS" \
         --batch_size "$SFT_BATCH_SIZE" \

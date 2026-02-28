@@ -14,6 +14,8 @@
 
 import os
 import inspect
+import types
+from typing import Any, Dict, Optional
 import torch
 
 # Hugging Face mirror defaults (honor existing env if user already set it).
@@ -22,6 +24,8 @@ os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import load_from_disk
+from src.envs.game_2048 import ACTION_MAP
+from src.utils.action_stats import ActionWindowStats
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
 
 try:
@@ -37,6 +41,9 @@ except ImportError:
     SFTConfig = None
     SFTTrainer = None
     TRL_AVAILABLE = False
+
+
+_ACTION_CHAR_TO_ID = {v: k for k, v in ACTION_MAP.items()}
 
 
 def _try_import_unsloth():
@@ -73,6 +80,170 @@ def _ensure_prompt_completion_dataset(dataset, split_name: str) -> None:
         raise ValueError(f"{split_name} sample `completion` must be non-empty message list")
 
 
+def _decode_action_from_token_id(tokenizer, token_id: int) -> Optional[int]:
+    try:
+        piece = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    except Exception:
+        return None
+    normalized = str(piece).strip().lstrip("Ġ").lstrip("▁").strip()
+    if len(normalized) == 1 and normalized in _ACTION_CHAR_TO_ID:
+        return int(_ACTION_CHAR_TO_ID[normalized])
+    return None
+
+
+def _build_action_token_map(tokenizer) -> Dict[int, int]:
+    token_to_action: Dict[int, int] = {}
+    for action_id, char in ACTION_MAP.items():
+        try:
+            token_ids = tokenizer.encode(char, add_special_tokens=False)
+        except Exception:
+            continue
+        if len(token_ids) == 1:
+            token_to_action[int(token_ids[0])] = int(action_id)
+    return token_to_action
+
+
+def _extract_logits_from_outputs(outputs: Any) -> Any:
+    if outputs is None:
+        return None
+    if isinstance(outputs, dict):
+        return outputs.get("logits")
+    if hasattr(outputs, "get"):
+        try:
+            return outputs.get("logits")
+        except Exception:
+            pass
+    if hasattr(outputs, "logits"):
+        return getattr(outputs, "logits", None)
+    if isinstance(outputs, (list, tuple)):
+        for item in outputs:
+            if hasattr(item, "shape") and len(getattr(item, "shape", [])) == 3:
+                return item
+    return None
+
+
+def _extract_action_target_from_row(
+    *,
+    label_row: Any,
+    valid_positions: Any,
+    token_to_action: Dict[int, int],
+    tokenizer: Any,
+) -> Optional[tuple[int, int]]:
+    """Find last action token in supervised labels: return (pos, action_id)."""
+    for pos_tensor in reversed(valid_positions):
+        pos = int(pos_tensor.item())
+        target_token = int(label_row[pos].item())
+        target_action = token_to_action.get(target_token)
+        if target_action is not None:
+            return pos, int(target_action)
+    return None
+
+
+def _update_sft_action_window_stats(
+    *,
+    stats: ActionWindowStats,
+    labels: Any,
+    logits: Any,
+    token_to_action: Dict[int, int],
+    tokenizer: Any,
+) -> None:
+    if labels is None or logits is None:
+        return
+    if not hasattr(labels, "shape") or not hasattr(logits, "shape"):
+        return
+    if len(labels.shape) != 2 or len(logits.shape) != 3:
+        return
+    if logits.shape[0] != labels.shape[0] or logits.shape[1] != labels.shape[1]:
+        return
+
+    with torch.no_grad():
+        pred_ids = torch.argmax(logits, dim=-1)
+        label_mask = labels.ne(-100)
+
+        for row_idx in range(int(labels.shape[0])):
+            valid_positions = torch.nonzero(label_mask[row_idx], as_tuple=False)
+            if valid_positions.numel() == 0:
+                continue
+
+            action_target = _extract_action_target_from_row(
+                label_row=labels[row_idx],
+                valid_positions=valid_positions,
+                token_to_action=token_to_action,
+                tokenizer=tokenizer,
+            )
+            if action_target is None:
+                continue
+            action_pos, target_action = action_target
+            # CausalLM next-token alignment:
+            # logits[t] predicts labels[t+1], so action label at p should use logits[p-1].
+            if action_pos <= 0:
+                continue
+            pred_token = int(pred_ids[row_idx, action_pos - 1].item())
+
+            pred_action = token_to_action.get(pred_token)
+            if pred_action is None:
+                pred_action = _decode_action_from_token_id(tokenizer, pred_token)
+
+            parsed = pred_action is not None
+            stats.update(
+                parsed=parsed,
+                legal=parsed,
+                correct=bool(parsed and pred_action == target_action),
+            )
+
+
+def _patch_sft_trainer_action_window_logging(trainer: Any, tokenizer: Any) -> ActionWindowStats:
+    """Patch SFT trainer to log windowed action stats on default log interval."""
+    stats = ActionWindowStats()
+    token_to_action = _build_action_token_map(tokenizer)
+    if not token_to_action:
+        print("[SFT] 警告: 未找到单token动作映射，action_acc 可能偏低。")
+
+    original_compute_loss = trainer.compute_loss
+    compute_sig = inspect.signature(original_compute_loss)
+    supports_return_outputs = "return_outputs" in compute_sig.parameters
+
+    def _wrapped_compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
+        outputs = None
+        if supports_return_outputs:
+            loss, outputs = original_compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                *args,
+                **kwargs,
+            )
+        else:
+            loss = original_compute_loss(model, inputs, *args, **kwargs)
+
+        try:
+            labels = inputs.get("labels") if hasattr(inputs, "get") else None
+            _update_sft_action_window_stats(
+                stats=stats,
+                labels=labels,
+                logits=_extract_logits_from_outputs(outputs),
+                token_to_action=token_to_action,
+                tokenizer=tokenizer,
+            )
+        except Exception:
+            pass
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    original_log = trainer.log
+
+    def _wrapped_log(self, logs, *args, **kwargs):
+        merged = dict(logs) if isinstance(logs, dict) else {}
+        merged.update(stats.flush())
+        return original_log(merged, *args, **kwargs)
+
+    trainer.compute_loss = types.MethodType(_wrapped_compute_loss, trainer)
+    trainer.log = types.MethodType(_wrapped_log, trainer)
+    return stats
+
+
 def _build_sft_config(
     *,
     output_dir: str,
@@ -97,12 +268,11 @@ def _build_sft_config(
         "output_dir": output_dir,
         "num_train_epochs": num_epochs,
         "per_device_train_batch_size": batch_size,
-        "per_device_eval_batch_size": batch_size * 2,
         "gradient_accumulation_steps": gradient_accumulation,
         "learning_rate": learning_rate,
         "warmup_ratio": 0.1,
         "lr_scheduler_type": "cosine",
-        "disable_tqdm": True,
+        "disable_tqdm": False,
         "logging_steps": 4,
         "save_strategy": "epoch",
         "save_total_limit": 3,
@@ -121,10 +291,11 @@ def _build_sft_config(
             # to prevent GradScaler trying to unscale bf16 gradients.
             kwargs["fp16"] = not use_bf16
 
+    # Disable legacy validation-loss evaluation path.
     if "eval_strategy" in params:
-        kwargs["eval_strategy"] = "epoch"
+        kwargs["eval_strategy"] = "no"
     elif "evaluation_strategy" in params:
-        kwargs["evaluation_strategy"] = "epoch"
+        kwargs["evaluation_strategy"] = "no"
 
     if "dataset_text_field" in params:
         # We train with prompt/completion conversational samples, not legacy text field.
@@ -180,7 +351,6 @@ def _build_sft_trainer(
     model,
     sft_config,
     train_dataset,
-    eval_dataset,
     tokenizer,
     data_collator=None,
 ):
@@ -190,13 +360,12 @@ def _build_sft_trainer(
         "model": model,
         "args": sft_config,
         "train_dataset": train_dataset,
-        "eval_dataset": eval_dataset,
     }
 
-    if "tokenizer" in params:
-        kwargs["tokenizer"] = tokenizer
-    elif "processing_class" in params:
+    if "processing_class" in params:
         kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in params:
+        kwargs["tokenizer"] = tokenizer
     if "eos_token" in params and getattr(tokenizer, "eos_token", None):
         kwargs["eos_token"] = tokenizer.eos_token
     if "pad_token" in params and getattr(tokenizer, "pad_token", None):
@@ -207,7 +376,6 @@ def _build_sft_trainer(
         kwargs["pad_token_id"] = int(tokenizer.pad_token_id)
     if "data_collator" in params and data_collator is not None:
         kwargs["data_collator"] = data_collator
-
     return SFTTrainer(**kwargs)
 
 
@@ -311,12 +479,9 @@ def train_sft(
     # 1. 加载数据集
     print("\n📊 加载数据集...")
     train_dataset = load_from_disk(train_data)
-    val_dataset = load_from_disk(val_data)
 
     print(f"  训练集: {len(train_dataset)} 样本")
-    print(f"  验证集: {len(val_dataset)} 样本")
     _ensure_prompt_completion_dataset(train_dataset, "train")
-    _ensure_prompt_completion_dataset(val_dataset, "val")
     print("  数据集格式: conversational prompt-completion")
 
     # 2. 加载模型和Tokenizer
@@ -372,6 +537,8 @@ def train_sft(
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if getattr(tokenizer, "padding_side", None) != "left":
+        tokenizer.padding_side = "left"
 
     # 3. 配置LoRA
     print("🔧 配置LoRA...")
@@ -425,9 +592,9 @@ def train_sft(
         model=model,
         sft_config=sft_config,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
         tokenizer=tokenizer,
     )
+    action_stats = _patch_sft_trainer_action_window_logging(trainer, tokenizer)
 
     # 显示可训练参数
     trainable_params = trainer.model.get_nb_trainable_parameters()
@@ -436,6 +603,9 @@ def train_sft(
     # 6. 训练
     print("开始训练...")
     trainer.train()
+    tail_metrics = action_stats.flush()
+    if tail_metrics:
+        trainer.log(tail_metrics)
 
     # 7. 保存模型
     print(f"\n💾 保存模型到 {output_dir}")

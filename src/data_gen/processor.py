@@ -182,9 +182,9 @@ def games_to_training_format(
 
 def split_dataset(
     dataset: Dataset,
-    train_ratio: float = 0.9,
-    val_ratio: float = 0.08,
-    test_ratio: float = 0.02,
+    train_ratio: float = 0.98,
+    val_ratio: float = 0.01,
+    test_ratio: float = 0.01,
     seed: int = 42,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """Split dataset into train/val/test sets."""

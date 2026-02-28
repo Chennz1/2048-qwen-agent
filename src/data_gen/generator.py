@@ -591,13 +591,13 @@ class ThinkingHeuristicPlayer:
         Args:
             difficulty: 难度等级 ('random', 'basic', 'intermediate', 'advanced', 'expert')
             seed: 随机种子
-            enable_diversity: 是否启用CoT多样性生成（默认True）
+            enable_diversity: 兼容参数（当前版本始终启用CoT多样性）
             expert_depth: expert策略expectimax搜索深度
             expert_max_empty: expert策略chance节点最大空位分支数
         """
         self.difficulty = difficulty
-        self.enable_diversity = enable_diversity
-        self.diversity_generator = CoTDiversityGenerator() if enable_diversity else None
+        self.enable_diversity = True
+        self.diversity_generator = CoTDiversityGenerator(seed=seed)
         # Dedicated RNG for CoT phrasing diversity.
         self._thinking_rng = random.Random(seed)
         self.expert_policy: Optional[Expectimax2048Policy] = None
@@ -636,7 +636,7 @@ class ThinkingHeuristicPlayer:
 
     def _analyze_board_for_action(self, game: Game2048, chosen_action: int) -> str:
         """
-        为选定动作生成思考过程（固定为结构化简洁风格）
+        为选定动作生成思考过程。
 
         Args:
             game: 游戏状态
@@ -645,7 +645,7 @@ class ThinkingHeuristicPlayer:
         Returns:
             思考文本
         """
-        return self._analyze_canonical(game, chosen_action)
+        return self._analyze_with_diversity(game, chosen_action)
 
     def _build_state_snapshot(self, game: Game2048) -> str:
         """Build a concise, high-information board summary for CoT."""
@@ -673,62 +673,6 @@ class ThinkingHeuristicPlayer:
         final_template = self._pick_template(self.FINAL_DECISION_TEMPLATES)
         normalized.append(final_template.format(action_name=action_name))
         return "；".join(normalized) + "。"
-
-    def _analyze_canonical(self, game: Game2048, chosen_action: int) -> str:
-        """
-        Canonical CoT style (industry-practical):
-        - concise
-        - verifiable
-        - action-grounded
-        """
-        parts = [self._build_state_snapshot(game)]
-
-        max_tile = game.get_max_tile()
-        max_pos = self._find_max_tile_position(game)
-        corner_names = {
-            (0, 0): "左上角",
-            (0, 3): "右上角",
-            (3, 0): "左下角",
-            (3, 3): "右下角",
-        }
-        action_name = ACTION_MAP[chosen_action]
-
-        # 策略主因：角落稳定性 + 合并收益 + 单调性（可验证）
-        if max_pos in corner_names:
-            corner = corner_names[max_pos]
-            if self._action_preserves_corner(max_pos, chosen_action):
-                keep_template = self._pick_template(self.CORNER_KEEP_TEMPLATES)
-                parts.append(keep_template.format(max_tile=max_tile, corner=corner))
-            else:
-                break_template = self._pick_template(self.CORNER_BREAK_TEMPLATES)
-                parts.append(break_template.format(max_tile=max_tile, corner=corner))
-        else:
-            non_corner_template = self._pick_template(self.NON_CORNER_TEMPLATES)
-            parts.append(non_corner_template.format(max_tile=max_tile))
-
-        merge_opportunities = self._find_merge_opportunities(game)
-        if chosen_action in merge_opportunities:
-            merge_template = self._pick_template(self.MERGE_GAIN_TEMPLATES)
-            parts.append(merge_template.format(action_name=action_name))
-        else:
-            setup_template = self._pick_template(self.MERGE_SETUP_TEMPLATES)
-            parts.append(setup_template.format(action_name=action_name))
-
-        if self.difficulty in ['intermediate', 'advanced', 'expert']:
-            test_game = game.clone()
-            test_game._move(chosen_action)
-            new_monotonicity = self._calculate_monotonicity(test_game.grid)
-            old_monotonicity = self._calculate_monotonicity(game.grid)
-            if new_monotonicity > old_monotonicity:
-                parts.append(self._pick_template(self.MONOTONICITY_TEMPLATES))
-
-        if self.difficulty in ['advanced', 'expert']:
-            empty_count = game.get_empty_cells()
-            if empty_count < 4:
-                low_space_template = self._pick_template(self.LOW_SPACE_TEMPLATES)
-                parts.append(low_space_template.format(empty_count=empty_count))
-
-        return self._finalize_thinking(parts, chosen_action)
 
     def _analyze_with_diversity(self, game: Game2048, chosen_action: int) -> str:
         """
@@ -843,83 +787,6 @@ class ThinkingHeuristicPlayer:
                 space_desc = gen.generate_space_description(empty_count)
                 if space_desc:
                     parts.append(space_desc)
-
-        return self._finalize_thinking(parts, chosen_action)
-
-    def _analyze_standard(self, game: Game2048, chosen_action: int) -> str:
-        """
-        标准分析（不使用多样性生成）
-
-        Args:
-            game: 游戏状态
-            chosen_action: 已选择的动作
-
-        Returns:
-            思考文本
-        """
-        parts = [self._build_state_snapshot(game)]
-
-        # 1. 分析最大数字位置
-        max_tile = game.get_max_tile()
-        max_pos = self._find_max_tile_position(game)
-
-        corner_names = {
-            (0, 0): "左上角",
-            (0, 3): "右上角",
-            (3, 0): "左下角",
-            (3, 3): "右下角"
-        }
-
-        if max_pos in corner_names:
-            corner_name = corner_names[max_pos]
-            parts.append(f"最大数字{max_tile}在{corner_name}。")
-
-            # 检查选定的动作是否有利于保持基座
-            action_name = ACTION_MAP[chosen_action]
-            if self._action_preserves_corner(max_pos, chosen_action):
-                parts.append(f"选择向{action_name}移动，保持大数字在{corner_name}。")
-            else:
-                # 如果动作会移出基座，解释原因（比如为了合并）
-                merge_opportunities = self._find_merge_opportunities(game)
-                if chosen_action in merge_opportunities:
-                    parts.append(f"虽然会移出{corner_name}，但向{action_name}移动可以合并，优先合并。")
-                else:
-                    parts.append(f"向{action_name}移动。")
-        else:
-            parts.append(f"最大数字{max_tile}在位置{max_pos}。")
-
-            # 分析这个动作是否向角落移动
-            action_name = ACTION_MAP[chosen_action]
-            nearest_corner = self._find_nearest_corner(max_pos)
-            if nearest_corner:
-                suggested = self._suggest_action_to_corner(max_pos, nearest_corner)
-                if suggested == action_name:
-                    corner_name = corner_names[nearest_corner]
-                    parts.append(f"向{action_name}移动，将大数字移向{corner_name}。")
-                else:
-                    parts.append(f"向{action_name}移动。")
-
-        # 2. 分析这个动作的好处
-        merge_opportunities = self._find_merge_opportunities(game)
-        if chosen_action in merge_opportunities:
-            parts.append(f"这个方向可以合并相同数字。")
-        else:
-            # 检查是否保持单调性
-            if self.difficulty in ['intermediate', 'advanced', 'expert']:
-                # 模拟移动后的状态
-                test_game = game.clone()
-                test_game._move(chosen_action)
-                new_monotonicity = self._calculate_monotonicity(test_game.grid)
-                old_monotonicity = self._calculate_monotonicity(game.grid)
-
-                if new_monotonicity > old_monotonicity:
-                    parts.append(f"可以改善棋盘单调性。")
-
-        # 3. 根据难度添加额外分析
-        if self.difficulty in ['advanced', 'expert']:
-            empty_count = game.get_empty_cells()
-            if empty_count < 4:
-                parts.append(f"棋盘较满（剩余{empty_count}格），需要谨慎。")
 
         return self._finalize_thinking(parts, chosen_action)
 
@@ -1364,7 +1231,7 @@ def generate_games(
         difficulty: Difficulty level for the heuristic player
         seed: Random seed (if provided, each game will use seed + game_idx)
         with_thinking: Whether to include Chain-of-Thought reasoning
-        enable_diversity: Whether to enable CoT diversity generation (default True)
+        enable_diversity: Compatibility flag (CoT diversity is always enabled)
         expert_depth: expectimax搜索深度（仅expert难度生效）
         expert_max_empty: chance节点最大空位分支数（仅expert难度生效）
 
@@ -1478,7 +1345,7 @@ def generate_mixed_data(
         total_games: Total number of games to generate
         seed: Random seed (base seed, each difficulty level uses different offset)
         with_thinking: Whether to include Chain-of-Thought reasoning
-        enable_diversity: Whether to enable CoT diversity generation (default True)
+        enable_diversity: Compatibility flag (CoT diversity is always enabled)
         expert_depth: expectimax搜索深度（mixed中若包含expert时生效）
         expert_max_empty: chance节点最大空位分支数
 
@@ -1712,9 +1579,9 @@ def main():
     parser.add_argument('--with_thinking', action='store_true',
                         help='包含Chain-of-Thought思考过程')
     parser.add_argument('--enable_diversity', action='store_true', default=True,
-                        help='启用CoT多样性生成（默认启用，使用--no-enable_diversity禁用）')
+                        help='兼容参数：CoT多样性当前固定启用')
     parser.add_argument('--no_enable_diversity', dest='enable_diversity', action='store_false',
-                        help='禁用CoT多样性生成（使用固定模板）')
+                        help='兼容参数（已忽略）：当前版本不支持关闭CoT多样性')
     parser.add_argument('--expert_depth', type=int, default=2,
                         help='expert策略expectimax搜索深度（默认2）')
     parser.add_argument('--expert_max_empty', type=int, default=8,
@@ -1731,13 +1598,16 @@ def main():
                         help='可选：将数据版本manifest保存为JSON文件（默认 output_dir/manifest.json）')
 
     args = parser.parse_args()
+    if not args.enable_diversity:
+        print("提示: --no_enable_diversity 已忽略，当前版本固定启用 CoT 多样性。")
+    args.enable_diversity = True
 
     print(f"\n配置:")
     print(f"  游戏数量: {args.num_games}")
     print(f"  难度: {args.difficulty}")
     print(f"  输出目录: {args.output_dir}")
     print(f"  包含CoT: {args.with_thinking}")
-    print(f"  CoT多样性: {args.enable_diversity}")
+    print("  CoT多样性: True (fixed)")
     print(f"  Expert搜索深度: {args.expert_depth}")
     print(f"  Expert空位分支上限: {args.expert_max_empty}")
     print(f"  最低最终分数: {args.min_final_score}")

@@ -32,6 +32,7 @@ from transformers import AutoTokenizer
 
 from src.data_gen.prompting import format_inference_prompt
 from src.envs.game_2048 import ACTION_MAP, Game2048
+from src.utils.action_stats import ActionWindowStats
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
 
 
@@ -49,6 +50,13 @@ _ACTION_ID_HINT_RE = re.compile(r"(?:动作|action)\s*[:：]?\s*([0-3])", flags=
 _TRAILING_ACTION_CHAR_RE = re.compile(r"([上右下左])\s*$")
 _TRAILING_ACTION_ID_RE = re.compile(r"([0-3])\s*$")
 _ACTION_WORD_RE = re.compile(r"\b(up|right|down|left)\b", flags=re.I)
+_MAX_TILE_CLAIM_RE = re.compile(r"(?:最大(?:数字|块|值)?|max(?:\s*tile)?)\s*[:：]?\s*(\d+)", flags=re.I)
+_EMPTY_CLAIM_RE = re.compile(r"(?:空位|空格|空白|empty(?:\s*cells?)?)\s*[:：]?\s*(\d+)", flags=re.I)
+_VALID_ACTIONS_SEGMENT_RE = re.compile(r"(?:可行动作|合法动作|可选动作)[^。\n]*", flags=re.I)
+_FINAL_ACTION_CLAIM_RE = re.compile(
+    r"(?:最终|最后|选择|动作|着法|action|move)\s*(?:为|是|向|:|：)?\s*([上右下左]|[0-3]|up|right|down|left)",
+    flags=re.I,
+)
 _ACTION_CHAR_TO_ID = {v: k for k, v in ACTION_MAP.items()}
 _ACTION_WORD_TO_ID = {
     "up": 0,
@@ -126,6 +134,18 @@ def _patch_grpo_trainer_sampler_compat(trainer: Any) -> None:
         )
 
 
+def _patch_trainer_action_window_logging(trainer: Any, stats: ActionWindowStats) -> None:
+    """Patch trainer.log to emit window stats on the existing logging cadence."""
+    original_log = trainer.log
+
+    def _wrapped(self, logs, *args, **kwargs):
+        merged = dict(logs) if isinstance(logs, dict) else {}
+        merged.update(stats.flush())
+        return original_log(merged, *args, **kwargs)
+
+    trainer.log = types.MethodType(_wrapped, trainer)
+
+
 def _build_grpo_config(
     *,
     GRPOConfig: Any,
@@ -133,8 +153,6 @@ def _build_grpo_config(
     learning_rate: float,
     warmup_ratio: float,
     lr_scheduler_type: str,
-    clip_eps: float,
-    kl_beta: float,
     num_train_epochs: int,
     batch_size: int,
     gradient_accumulation_steps: int,
@@ -144,6 +162,8 @@ def _build_grpo_config(
     save_steps: int,
     logging_steps: int,
     report_to: List[str],
+    clip_eps: float,
+    kl_beta: float,
 ):
     """Build GRPOConfig with runtime compatibility across TRL versions."""
     params = set(inspect.signature(GRPOConfig.__init__).parameters.keys())
@@ -166,13 +186,6 @@ def _build_grpo_config(
         "use_vllm": True,
         "vllm_mode": "colocate",
         "vllm_gpu_memory_utilization" : 0.3,
-        # Keep these aliases for TRL version compatibility.
-        "epsilon": clip_eps,
-        "clip_range": clip_eps,
-        "cliprange": clip_eps,
-        "beta": kl_beta,
-        "kl_coef": kl_beta,
-        "kl_beta": kl_beta,
     }
 
     # Length args vary across TRL versions. Provide fallbacks when canonical
@@ -190,6 +203,16 @@ def _build_grpo_config(
             kwargs["response_length"] = max_completion_length
 
     filtered = {k: v for k, v in kwargs.items() if k in params}
+
+    for key in ("epsilon", "clip_eps", "clip_range"):
+        if key in params:
+            filtered[key] = clip_eps
+            break
+    for key in ("beta", "kl_beta"):
+        if key in params:
+            filtered[key] = kl_beta
+            break
+
     return GRPOConfig(**filtered)
 
 
@@ -242,15 +265,16 @@ class GRPO2048DataConfig:
 class ExpertRewardConfig:
     """Config for expert-shaped GRPO reward."""
 
-    format_penalty: float = -0.6
-    illegal_penalty: float = -1.2
+    format_penalty: float = -1.2
+    illegal_penalty: float = -0.6
     legal_bonus: float = 0.45
-    score_norm: float = 64.0
+    format_quality_weight: float = 0.05
     potential_norm: float = 5.0
     w_score: float = 0.20
     w_potential: float = 0.25
     w_expert: float = 0.35
-    w_risk: float = 0.08
+    w_cot_facts: float = 0.10
+    w_cot_consistency: float = 0.08
     expert_depth: int = 2
     expert_max_empty: int = 8
 
@@ -384,7 +408,6 @@ class BoardPotentialModel:
 
     def score(self, grid: np.ndarray, valid_actions: List[int]) -> float:
         empty_cells = int(np.sum(grid == 0))
-        max_tile = int(np.max(grid))
         smoothness = self._smoothness_penalty(grid)
         monotonicity = self._monotonicity(grid)
         merge_potential = self._merge_potential(grid)
@@ -397,7 +420,6 @@ class BoardPotentialModel:
             - smoothness * 0.8
             + merge_potential * 1.4
             + corner_bonus * 1.5
-            + np.log2(max(max_tile, 2)) * 1.0
             + mobility * 0.4
         )
 
@@ -568,6 +590,7 @@ class GRPO2048Rewards:
     """Reward functions compatible with TRL GRPOTrainer callbacks."""
 
     _cfg: ExpertRewardConfig = ExpertRewardConfig()
+    _window_stats: Optional[ActionWindowStats] = None
     _potential_model: BoardPotentialModel = BoardPotentialModel()
     _expert_scorer: ExpectimaxActionScorer = ExpectimaxActionScorer(
         potential_model=_potential_model,
@@ -585,22 +608,43 @@ class GRPO2048Rewards:
         )
 
     @classmethod
+    def attach_window_stats(cls, stats: Optional[ActionWindowStats]) -> None:
+        cls._window_stats = stats
+
+    @classmethod
+    def _record_window_stats(cls, *, parsed: bool, legal: bool, correct: bool) -> None:
+        if cls._window_stats is None:
+            return
+        cls._window_stats.update(parsed=parsed, legal=legal, correct=correct)
+
+    @classmethod
     def expert_shaped(cls, completions: List[Any], **kwargs) -> List[float]:
         state_col = kwargs.get("state_text")
         valid_actions_col = kwargs.get("valid_actions")
+        target_action_col = kwargs.get("target_action")
         rewards: List[float] = []
 
         for i, completion in enumerate(completions):
             text = _completion_to_text(completion)
-            action_id = _parse_action_id(text)
+            think_text = _extract_think_text(text)
+            action_id, format_quality = _parse_action_id_with_quality(text)
+            target_action_id = _coerce_action_id(
+                target_action_col[i] if target_action_col and i < len(target_action_col) else None
+            )
+            parsed = action_id is not None
+            legal = False
+            correct = bool(parsed and target_action_id is not None and action_id == target_action_id)
+
             if action_id is None:
                 rewards.append(float(cls._cfg.format_penalty))
+                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
             state_text = state_col[i] if state_col else ""
             game = _game_from_state_text(state_text)
             if game is None:
                 rewards.append(0.0)
+                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
             valid_actions = _coerce_valid_actions(valid_actions_col[i] if valid_actions_col else None)
@@ -608,48 +652,56 @@ class GRPO2048Rewards:
                 valid_actions = game.get_valid_actions()
             if not valid_actions:
                 rewards.append(0.0)
+                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
             if action_id not in valid_actions:
                 rewards.append(float(cls._cfg.illegal_penalty))
+                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
             prev_grid = np.array(game.grid, copy=True)
-            prev_empty = int(np.sum(prev_grid == 0))
-            prev_mobility = len(valid_actions)
-            prev_corner_locked = cls._potential_model.max_tile_in_corner(prev_grid)
             prev_potential = cls._potential_model.score(prev_grid, valid_actions)
 
             # Use deterministic transition (move without random tile spawn) to keep reward stable.
             next_grid, moved, score_gain = cls._expert_scorer._simulate_move(prev_grid, int(action_id))
             if not moved:
                 rewards.append(float(cls._cfg.illegal_penalty))
+                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
             score_gain = float(score_gain)
+            legal = True
             next_valid_actions = cls._expert_scorer._valid_actions(next_grid)
             next_potential = cls._potential_model.score(next_grid, next_valid_actions)
 
-            score_term = float(np.tanh(score_gain / max(cls._cfg.score_norm, 1e-6)))
+            if score_gain > 0:
+                score_term = float(1.0 + 0.02 * np.log(score_gain))
+            else:
+                score_term = 0.0
             potential_term = float(
                 np.tanh((next_potential - prev_potential) / max(cls._cfg.potential_norm, 1e-6))
             )
             expert_term = cls._expert_term(prev_grid, valid_actions, action_id)
-            risk_term = cls._risk_term(
-                prev_empty=prev_empty,
-                prev_mobility=prev_mobility,
-                prev_corner_locked=prev_corner_locked,
+            cot_fact_term = cls._cot_fact_term(think_text, prev_grid, valid_actions)
+            cot_consistency_term = cls._cot_consistency_term(
+                think_text=think_text,
+                action_id=action_id,
+                prev_grid=prev_grid,
                 next_grid=next_grid,
-                next_valid_actions=next_valid_actions,
             )
+            format_quality_term = cls._cfg.format_quality_weight * float(np.clip(format_quality, 0.0, 1.0))
 
             total_reward = (
                 cls._cfg.legal_bonus
                 + cls._cfg.w_score * score_term
                 + cls._cfg.w_potential * potential_term
                 + cls._cfg.w_expert * expert_term
-                + cls._cfg.w_risk * risk_term
+                + cls._cfg.w_cot_facts * cot_fact_term
+                + cls._cfg.w_cot_consistency * cot_consistency_term
+                + format_quality_term
             )
             rewards.append(float(total_reward))
+            cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
 
         return rewards
 
@@ -687,39 +739,54 @@ class GRPO2048Rewards:
         return float(np.clip(aligned, 0.0, 1.0))
 
     @classmethod
-    def _risk_term(
+    def _cot_fact_term(cls, think_text: str, grid: np.ndarray, valid_actions: List[int]) -> float:
+        if not think_text:
+            return 0.0
+
+        scores: List[float] = []
+        true_max_tile = int(np.max(grid))
+        true_empty = int(np.sum(grid == 0))
+        true_valid_set = set(int(a) for a in valid_actions)
+
+        for m in _MAX_TILE_CLAIM_RE.finditer(think_text):
+            claim = int(m.group(1))
+            scores.append(1.0 if claim == true_max_tile else -1.0)
+
+        for m in _EMPTY_CLAIM_RE.finditer(think_text):
+            claim = int(m.group(1))
+            scores.append(1.0 if claim == true_empty else -1.0)
+
+        claimed_actions = _extract_claimed_action_set(think_text)
+        if claimed_actions is not None:
+            scores.append(1.0 if set(claimed_actions) == true_valid_set else -1.0)
+
+        if not scores:
+            return 0.0
+        return float(np.clip(float(np.mean(scores)), -1.0, 1.0))
+
+    @classmethod
+    def _cot_consistency_term(
         cls,
-        prev_empty: int,
-        prev_mobility: int,
-        prev_corner_locked: bool,
+        think_text: str,
+        action_id: int,
+        prev_grid: np.ndarray,
         next_grid: np.ndarray,
-        next_valid_actions: List[int],
     ) -> float:
-        next_empty = int(np.sum(next_grid == 0))
-        next_mobility = len(next_valid_actions)
-        next_corner_locked = cls._potential_model.max_tile_in_corner(next_grid)
+        if not think_text:
+            return 0.0
 
-        risk = 0.0
-        if next_empty <= 1:
-            risk -= 0.5
-        elif next_empty <= 2:
-            risk -= 0.25
+        scores: List[float] = []
+        claimed_final = _extract_claimed_final_action(think_text)
+        if claimed_final is not None:
+            scores.append(1.0 if int(claimed_final) == int(action_id) else -1.0)
 
-        if next_mobility <= 1:
-            risk -= 0.5
-        elif next_mobility == 2:
-            risk -= 0.2
+        if _mentions_corner_preserve(think_text) and cls._potential_model.max_tile_in_corner(prev_grid):
+            next_corner_locked = cls._potential_model.max_tile_in_corner(next_grid)
+            scores.append(1.0 if next_corner_locked else -1.0)
 
-        if prev_corner_locked and not next_corner_locked:
-            risk -= 0.3
-
-        if next_empty >= 5 and next_mobility >= 3:
-            risk += 0.3
-        if next_empty > prev_empty and next_mobility >= prev_mobility:
-            risk += 0.2
-
-        return float(np.clip(risk, -1.0, 1.0))
-
+        if not scores:
+            return 0.0
+        return float(np.clip(float(np.mean(scores)), -1.0, 1.0))
 
 class TRLGRPO2048Trainer:
     """High-level trainer using TRL GRPOTrainer."""
@@ -766,8 +833,6 @@ class TRLGRPO2048Trainer:
             learning_rate=learning_rate,
             warmup_ratio=warmup_ratio,
             lr_scheduler_type=lr_scheduler_type,
-            clip_eps=clip_eps,
-            kl_beta=kl_beta,
             num_train_epochs=num_train_epochs,
             batch_size=batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -777,6 +842,8 @@ class TRLGRPO2048Trainer:
             save_steps=save_steps,
             logging_steps=logging_steps,
             report_to=report_to,
+            clip_eps=clip_eps,
+            kl_beta=kl_beta,
         )
 
         reward_funcs = GRPO2048Rewards.get_reward_funcs()
@@ -795,8 +862,18 @@ class TRLGRPO2048Trainer:
                 trainer_kwargs["tokenizer"] = tokenizer
 
         trainer = GRPOTrainer(**trainer_kwargs)
+        _patch_grpo_trainer_sampler_compat(trainer)
+        action_stats = ActionWindowStats()
+        GRPO2048Rewards.attach_window_stats(action_stats)
+        _patch_trainer_action_window_logging(trainer, action_stats)
 
-        trainer.train()
+        try:
+            trainer.train()
+            tail_metrics = action_stats.flush()
+            if tail_metrics:
+                trainer.log(tail_metrics)
+        finally:
+            GRPO2048Rewards.attach_window_stats(None)
         trainer.save_model(self.output_dir)
 
         # Save metadata for consistent checkpoint contract.
@@ -840,39 +917,98 @@ def _parse_strict_action_id(text: str) -> Optional[int]:
 
 def _parse_action_id(text: str) -> Optional[int]:
     """Parse action with strict-first and robust fallbacks."""
+    action_id, _ = _parse_action_id_with_quality(text)
+    return action_id
+
+
+def _parse_action_id_with_quality(text: str) -> Tuple[Optional[int], float]:
+    """Parse action and return (action_id, format_quality in [0,1])."""
     normalized = _normalize_completion_text(text)
 
     strict = _parse_strict_action_id(normalized)
     if strict is not None:
-        return strict
+        return strict, 1.0
 
     hinted_char = _ACTION_CHAR_HINT_RE.search(normalized)
     if hinted_char:
-        return _ACTION_CHAR_TO_ID.get(hinted_char.group(1))
+        return _ACTION_CHAR_TO_ID.get(hinted_char.group(1)), 0.8
 
     hinted_id = _ACTION_ID_HINT_RE.search(normalized)
     if hinted_id:
-        return int(hinted_id.group(1))
+        return int(hinted_id.group(1)), 0.75
 
     tail_char = _TRAILING_ACTION_CHAR_RE.search(normalized)
     if tail_char:
-        return _ACTION_CHAR_TO_ID.get(tail_char.group(1))
+        return _ACTION_CHAR_TO_ID.get(tail_char.group(1)), 0.65
 
     tail_id = _TRAILING_ACTION_ID_RE.search(normalized)
     if tail_id:
-        return int(tail_id.group(1))
+        return int(tail_id.group(1)), 0.6
 
     words = _ACTION_WORD_RE.findall(normalized)
     if words:
-        return _ACTION_WORD_TO_ID.get(words[-1].lower())
+        return _ACTION_WORD_TO_ID.get(words[-1].lower()), 0.55
 
     # Last-resort recovery: if model outputs multiple directions in analysis text,
     # prefer the final one as the final decision token.
     chars = [ch for ch in normalized if ch in _ACTION_CHAR_TO_ID]
     if chars:
-        return _ACTION_CHAR_TO_ID.get(chars[-1])
+        return _ACTION_CHAR_TO_ID.get(chars[-1]), 0.4
 
+    return None, 0.0
+
+
+def _decode_action_token(token: str) -> Optional[int]:
+    token_norm = token.strip().lower()
+    if not token_norm:
+        return None
+    if token_norm in _ACTION_WORD_TO_ID:
+        return _ACTION_WORD_TO_ID[token_norm]
+    if token_norm in {"上", "右", "下", "左"}:
+        return _ACTION_CHAR_TO_ID.get(token_norm)
+    if token_norm in {"0", "1", "2", "3"}:
+        return int(token_norm)
     return None
+
+
+def _extract_think_text(text: str) -> str:
+    normalized = _normalize_completion_text(text)
+    match = re.search(r"<think>\s*([\s\S]*?)\s*</think>", normalized, flags=re.I)
+    if match:
+        return match.group(1).strip()
+    return normalized
+
+
+def _extract_claimed_action_set(text: str) -> Optional[List[int]]:
+    segments = _VALID_ACTIONS_SEGMENT_RE.findall(text)
+    for seg in segments:
+        actions: List[int] = []
+        for ch in seg:
+            if ch in _ACTION_CHAR_TO_ID:
+                actions.append(int(_ACTION_CHAR_TO_ID[ch]))
+        for d in re.findall(r"[0-3]", seg):
+            actions.append(int(d))
+        for word in _ACTION_WORD_RE.findall(seg):
+            action_id = _ACTION_WORD_TO_ID.get(word.lower())
+            if action_id is not None:
+                actions.append(int(action_id))
+        if actions:
+            return sorted(set(actions))
+    return None
+
+
+def _extract_claimed_final_action(text: str) -> Optional[int]:
+    matches = _FINAL_ACTION_CLAIM_RE.findall(text)
+    if not matches:
+        return None
+    return _decode_action_token(matches[-1])
+
+
+def _mentions_corner_preserve(text: str) -> bool:
+    if "角" not in text:
+        return False
+    keywords = ["保持", "固定", "锁", "不要", "避免", "留在", "别把", "不能"]
+    return any(k in text for k in keywords)
 
 
 def _completion_to_text(completion: Any) -> str:
@@ -907,6 +1043,19 @@ def _coerce_valid_actions(value: Any) -> List[int]:
     return []
 
 
+def _coerce_action_id(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, np.integer)):
+        action_id = int(value)
+        return action_id if 0 <= action_id <= 3 else None
+    if isinstance(value, str):
+        decoded = _decode_action_token(value)
+        if decoded is not None and 0 <= int(decoded) <= 3:
+            return int(decoded)
+    return None
+
+
 def _game_from_state_text(state_text: str) -> Optional[Game2048]:
     if not state_text:
         return None
@@ -937,6 +1086,13 @@ def _validate_batch_generation_compatibility(batch_size: int, num_generations: i
             f"Incompatible settings: global_train_batch_size={global_batch} "
             f"(batch_size={batch_size}, world_size={world_size}) is not divisible by "
             f"num_generations={k}. Valid num_generations: {valid}"
+        )
+    prompts_per_step = global_batch // k
+    if prompts_per_step < 2:
+        print(
+            "[GRPO] 警告: 每步仅有 1 个prompt组 "
+            f"(global_batch={global_batch}, num_generations={k})。"
+            "这会放大 reward zero-std 风险，建议降低 --num_generations 或提升 --batch_size。"
         )
 
 
@@ -978,15 +1134,16 @@ def main():
         choices=["expert_shaped"],
         help="GRPO reward mode (expert_shaped only)",
     )
-    parser.add_argument("--reward_format_penalty", type=float, default=-0.6)
-    parser.add_argument("--reward_illegal_penalty", type=float, default=-1.2)
+    parser.add_argument("--reward_format_penalty", type=float, default=-1.2)
+    parser.add_argument("--reward_illegal_penalty", type=float, default=-0.6)
     parser.add_argument("--reward_legal_bonus", type=float, default=0.45)
-    parser.add_argument("--reward_score_norm", type=float, default=64.0)
+    parser.add_argument("--reward_format_quality_weight", type=float, default=0.05)
     parser.add_argument("--reward_potential_norm", type=float, default=5.0)
     parser.add_argument("--reward_w_score", type=float, default=0.20)
     parser.add_argument("--reward_w_potential", type=float, default=0.25)
     parser.add_argument("--reward_w_expert", type=float, default=0.35)
-    parser.add_argument("--reward_w_risk", type=float, default=0.08)
+    parser.add_argument("--reward_w_cot_facts", type=float, default=0.10)
+    parser.add_argument("--reward_w_cot_consistency", type=float, default=0.08)
     parser.add_argument("--reward_expert_depth", type=int, default=2)
     parser.add_argument("--reward_expert_max_empty", type=int, default=8)
 
@@ -1059,12 +1216,13 @@ def main():
         format_penalty=args.reward_format_penalty,
         illegal_penalty=args.reward_illegal_penalty,
         legal_bonus=args.reward_legal_bonus,
-        score_norm=args.reward_score_norm,
+        format_quality_weight=args.reward_format_quality_weight,
         potential_norm=args.reward_potential_norm,
         w_score=args.reward_w_score,
         w_potential=args.reward_w_potential,
         w_expert=args.reward_w_expert,
-        w_risk=args.reward_w_risk,
+        w_cot_facts=args.reward_w_cot_facts,
+        w_cot_consistency=args.reward_w_cot_consistency,
         expert_depth=args.reward_expert_depth,
         expert_max_empty=args.reward_expert_max_empty,
     )

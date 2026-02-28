@@ -60,6 +60,10 @@ NON_THINKING_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
 }
 
+RANDOM_EVAL_INIT_TILES_MIN = 1
+RANDOM_EVAL_INIT_TILES_MAX = 4
+RANDOM_EVAL_INIT_PROB_4 = 0.5
+
 
 class Game2048Evaluator:
     """2048 game evaluator"""
@@ -541,8 +545,13 @@ class Game2048Evaluator:
             records = []
             for game_idx in range(start, end):
                 game_seed = self._derive_episode_seed(seed, game_idx)
+                episode_rng = random.Random(game_seed)
+                init_tiles = episode_rng.randint(
+                    RANDOM_EVAL_INIT_TILES_MIN,
+                    RANDOM_EVAL_INIT_TILES_MAX,
+                )
                 game = Game2048(seed=game_seed)
-                game.reset()
+                game.reset(initial_tiles=init_tiles, prob_4=RANDOM_EVAL_INIT_PROB_4)
                 records.append({
                     "game": game,
                     "game_idx": game_idx,

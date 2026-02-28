@@ -79,6 +79,10 @@ NON_THINKING_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
 }
 
+RANDOM_EVAL_INIT_TILES_MIN = 1
+RANDOM_EVAL_INIT_TILES_MAX = 4
+RANDOM_EVAL_INIT_PROB_4 = 0.5
+
 
 @dataclass
 class AgentDecision:
@@ -603,8 +607,13 @@ def evaluate_agent(
                 bucket_counter[bucket] = bucket_counter.get(bucket, 0) + 1
             else:
                 game_seed = derive_episode_seed(seed, game_idx, tag=agent.name)
+                episode_rng = random.Random(game_seed)
+                init_tiles = episode_rng.randint(
+                    RANDOM_EVAL_INIT_TILES_MIN,
+                    RANDOM_EVAL_INIT_TILES_MAX,
+                )
                 game = Game2048(seed=game_seed)
-                game.reset()
+                game.reset(initial_tiles=init_tiles, prob_4=RANDOM_EVAL_INIT_PROB_4)
 
             records.append(
                 {
