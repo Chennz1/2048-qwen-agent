@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import json
 
-from src.envs.game_2048 import Game2048, ACTION_MAP, parse_action_from_text
+from src.envs.game_2048 import (
+    Game2048,
+    ACTION_MAP,
+    parse_action_from_non_think_text,
+)
 from src.data_gen.prompting import format_inference_prompt
 
 # Hugging Face mirror defaults (honor existing env if user already set it).
@@ -383,8 +387,17 @@ class Game2048Evaluator:
         temperature: Optional[float] = None,
     ) -> List[int]:
         """Predict actions for a batch of states."""
+        actions, _ = self.predict_actions_with_responses(state_texts, temperature)
+        return actions
+
+    def predict_actions_with_responses(
+        self,
+        state_texts: List[str],
+        temperature: Optional[float] = None,
+    ) -> tuple[List[int], List[str]]:
+        """Predict actions and return raw model responses for diagnostics."""
         if not state_texts:
-            return []
+            return [], []
         if self.use_vllm:
             return self._predict_actions_vllm(state_texts, temperature)
         return self._predict_actions_standard(state_texts, temperature)
@@ -393,7 +406,7 @@ class Game2048Evaluator:
         self,
         state_texts: List[str],
         temperature: Optional[float],
-    ) -> List[int]:
+    ) -> tuple[List[int], List[str]]:
         """使用 vLLM 批量预测动作
 
         使用与训练数据相同的 prompt 格式，确保一致性。
@@ -433,16 +446,19 @@ class Game2048Evaluator:
             outputs = self.vllm_model.generate(prompts, sampling_params, use_tqdm=False)
 
         actions: List[int] = []
+        responses: List[str] = []
         for out in outputs:
             text = out.outputs[0].text if out.outputs else ""
-            actions.append(parse_action_from_text(text))
-        return actions
+            responses.append(text)
+            parsed = parse_action_from_non_think_text(text)
+            actions.append(int(parsed) if parsed is not None else -1)
+        return actions, responses
 
     def _predict_actions_standard(
         self,
         state_texts: List[str],
         temperature: Optional[float],
-    ) -> List[int]:
+    ) -> tuple[List[int], List[str]]:
         """使用标准方式批量预测动作
 
         使用与训练数据相同的 prompt 格式，确保一致性。
@@ -493,14 +509,17 @@ class Game2048Evaluator:
 
         prompt_len = inputs["input_ids"].shape[1]
         actions: List[int] = []
+        responses: List[str] = []
         for seq in outputs:
             response = self.tokenizer.decode(
                 seq[prompt_len:],
                 skip_special_tokens=True,
             )
-            actions.append(parse_action_from_text(response))
+            responses.append(response)
+            parsed = parse_action_from_non_think_text(response)
+            actions.append(int(parsed) if parsed is not None else -1)
 
-        return actions
+        return actions, responses
 
     def evaluate(
         self,
@@ -529,6 +548,9 @@ class Game2048Evaluator:
         max_tiles = []
         legal_move_ratios = []
         steps_list = []
+        first_illegal_scores = []
+        total_moves_all = 0
+        total_legal_moves = 0
 
         if seed is not None:
             random.seed(seed)
@@ -558,6 +580,10 @@ class Game2048Evaluator:
                     "done": False,
                     "total_moves": 0,
                     "legal_moves": 0,
+                    "first_illegal_score": None,
+                    "first_illegal_step": None,
+                    "first_illegal_state": None,
+                    "first_illegal_response": None,
                 })
 
             for _ in range(max_steps):
@@ -566,9 +592,9 @@ class Game2048Evaluator:
                     break
 
                 states = [records[i]["game"]._get_state() for i in active_indices]
-                actions = self.predict_actions(states, temperature=temperature)
+                actions, responses = self.predict_actions_with_responses(states, temperature=temperature)
 
-                for rec_idx, action in zip(active_indices, actions):
+                for local_i, (rec_idx, action, response) in enumerate(zip(active_indices, actions, responses)):
                     rec = records[rec_idx]
                     game = rec["game"]
                     was_done = rec["done"]
@@ -576,16 +602,36 @@ class Game2048Evaluator:
                     is_legal = action in valid_actions
                     if is_legal:
                         rec["legal_moves"] += 1
+                        total_legal_moves += 1
                         _, _, done, _ = game.step(action)
                     else:
+                        if rec["first_illegal_score"] is None:
+                            rec["first_illegal_score"] = int(game.score)
+                            rec["first_illegal_step"] = int(rec["total_moves"]) + 1
+                            rec["first_illegal_state"] = states[local_i]
+                            rec["first_illegal_response"] = response
+                            if verbose:
+                                print(
+                                    f"Game {rec['game_idx']} first illegal at step {rec['first_illegal_step']} | "
+                                    f"score={rec['first_illegal_score']}"
+                                )
+                                print("Board state:")
+                                print(rec["first_illegal_state"])
+                                print("Model response:")
+                                print(rec["first_illegal_response"])
                         if valid_actions:
                             _, _, done, _ = game.step(valid_actions[0])
                         else:
                             done = True
                     rec["total_moves"] += 1
+                    total_moves_all += 1
                     rec["done"] = bool(done)
                     if verbose and (not was_done) and rec["done"]:
-                        print(f"Game {rec['game_idx']} finished with score={game.score}")
+                        print(
+                            f"Game {rec['game_idx']} finished | "
+                            f"final_score={game.score} | "
+                            f"first_illegal_score={rec['first_illegal_score']}"
+                        )
 
             for rec in records:
                 game = rec["game"]
@@ -594,9 +640,12 @@ class Game2048Evaluator:
                 max_tiles.append(game.get_max_tile())
                 legal_move_ratios.append(rec["legal_moves"] / total_moves if total_moves > 0 else 0)
                 steps_list.append(total_moves)
+                first_illegal_scores.append(rec["first_illegal_score"])
                 completed += 1
                 if verbose and completed % 10 == 0:
                     print(f"Completed {completed}/{num_games} games")
+
+        games_with_illegal = [s for s in first_illegal_scores if s is not None]
 
         results = {
             'num_games': num_games,
@@ -607,12 +656,21 @@ class Game2048Evaluator:
             'median_score': float(np.median(scores)),
             'mean_max_tile': float(np.mean(max_tiles)),
             'max_tile_reached': int(np.max(max_tiles)),
-            'legal_move_rate': float(np.mean(legal_move_ratios)),
+            'legal_move_rate': float(total_legal_moves / total_moves_all) if total_moves_all > 0 else 0.0,
+            'legal_move_rate_per_game': float(np.mean(legal_move_ratios)),
+            'total_moves': int(total_moves_all),
+            'total_legal_moves': int(total_legal_moves),
             'mean_steps': float(np.mean(steps_list)),
             'scores': [int(s) for s in scores],
             'max_tiles': [int(t) for t in max_tiles],
             'legal_move_ratios': [float(r) for r in legal_move_ratios],
-            'steps': [int(s) for s in steps_list]
+            'steps': [int(s) for s in steps_list],
+            'first_illegal_scores': first_illegal_scores,
+            'num_games_with_illegal': int(len(games_with_illegal)),
+            'illegal_game_rate': float(len(games_with_illegal) / num_games) if num_games > 0 else 0.0,
+            'mean_first_illegal_score': (
+                float(np.mean(games_with_illegal)) if games_with_illegal else None
+            ),
         }
 
         return results
@@ -650,7 +708,10 @@ class Game2048Evaluator:
         max_tiles = []
         legal_move_ratios = []
         steps_list = []
+        first_illegal_scores = []
         bucket_counter: Dict[str, int] = {}
+        total_moves_all = 0
+        total_legal_moves = 0
 
         batch_size = max(1, int(batch_size))
         completed = 0
@@ -670,6 +731,10 @@ class Game2048Evaluator:
                     "done": False,
                     "total_moves": 0,
                     "legal_moves": 0,
+                    "first_illegal_score": None,
+                    "first_illegal_step": None,
+                    "first_illegal_state": None,
+                    "first_illegal_response": None,
                 })
 
             for _ in range(max_steps):
@@ -678,9 +743,9 @@ class Game2048Evaluator:
                     break
 
                 states = [records[i]["game"]._get_state() for i in active_indices]
-                actions = self.predict_actions(states, temperature=temperature)
+                actions, responses = self.predict_actions_with_responses(states, temperature=temperature)
 
-                for rec_idx, action in zip(active_indices, actions):
+                for local_i, (rec_idx, action, response) in enumerate(zip(active_indices, actions, responses)):
                     rec = records[rec_idx]
                     game = rec["game"]
                     was_done = rec["done"]
@@ -688,16 +753,36 @@ class Game2048Evaluator:
                     is_legal = action in valid_actions
                     if is_legal:
                         rec["legal_moves"] += 1
+                        total_legal_moves += 1
                         _, _, done, _ = game.step(action)
                     else:
+                        if rec["first_illegal_score"] is None:
+                            rec["first_illegal_score"] = int(game.score)
+                            rec["first_illegal_step"] = int(rec["total_moves"]) + 1
+                            rec["first_illegal_state"] = states[local_i]
+                            rec["first_illegal_response"] = response
+                            if verbose:
+                                print(
+                                    f"Snapshot {rec['game_idx']} first illegal at step {rec['first_illegal_step']} | "
+                                    f"score={rec['first_illegal_score']}"
+                                )
+                                print("Board state:")
+                                print(rec["first_illegal_state"])
+                                print("Model response:")
+                                print(rec["first_illegal_response"])
                         if valid_actions:
                             _, _, done, _ = game.step(valid_actions[0])
                         else:
                             done = True
                     rec["total_moves"] += 1
+                    total_moves_all += 1
                     rec["done"] = bool(done)
                     if verbose and (not was_done) and rec["done"]:
-                        print(f"Snapshot {rec['game_idx']} finished with score={game.score}")
+                        print(
+                            f"Snapshot {rec['game_idx']} finished | "
+                            f"final_score={game.score} | "
+                            f"first_illegal_score={rec['first_illegal_score']}"
+                        )
 
             for rec in records:
                 game = rec["game"]
@@ -706,9 +791,12 @@ class Game2048Evaluator:
                 max_tiles.append(game.get_max_tile())
                 legal_move_ratios.append(rec["legal_moves"] / total_moves if total_moves > 0 else 0)
                 steps_list.append(total_moves)
+                first_illegal_scores.append(rec["first_illegal_score"])
                 completed += 1
                 if verbose and completed % 20 == 0:
                     print(f"Completed {completed}/{len(samples)} snapshots")
+
+        games_with_illegal = [s for s in first_illegal_scores if s is not None]
 
         results = {
             'num_games': len(samples),
@@ -719,12 +807,21 @@ class Game2048Evaluator:
             'median_score': float(np.median(scores)),
             'mean_max_tile': float(np.mean(max_tiles)),
             'max_tile_reached': int(np.max(max_tiles)),
-            'legal_move_rate': float(np.mean(legal_move_ratios)),
+            'legal_move_rate': float(total_legal_moves / total_moves_all) if total_moves_all > 0 else 0.0,
+            'legal_move_rate_per_game': float(np.mean(legal_move_ratios)),
+            'total_moves': int(total_moves_all),
+            'total_legal_moves': int(total_legal_moves),
             'mean_steps': float(np.mean(steps_list)),
             'scores': [int(s) for s in scores],
             'max_tiles': [int(t) for t in max_tiles],
             'legal_move_ratios': [float(r) for r in legal_move_ratios],
             'steps': [int(s) for s in steps_list],
+            'first_illegal_scores': first_illegal_scores,
+            'num_games_with_illegal': int(len(games_with_illegal)),
+            'illegal_game_rate': float(len(games_with_illegal) / len(samples)) if samples else 0.0,
+            'mean_first_illegal_score': (
+                float(np.mean(games_with_illegal)) if games_with_illegal else None
+            ),
             'eval_set_path': eval_set_path,
             'bucket_distribution': bucket_counter,
         }
@@ -800,7 +897,15 @@ class Game2048Evaluator:
             print(f"{milestone:4d}: {count:3d} games ({pct:5.1f}%)")
 
         print(f"\n--- Move Statistics ---")
-        print(f"Legal move rate: {results['legal_move_rate']*100:.1f}%")
+        print(f"Legal move rate (step-weighted): {results['legal_move_rate']*100:.1f}%")
+        if "legal_move_rate_per_game" in results:
+            print(f"Legal move rate (per-game mean): {results['legal_move_rate_per_game']*100:.1f}%")
+        if "total_legal_moves" in results and "total_moves" in results:
+            print(f"Legal moves / total moves: {results['total_legal_moves']}/{results['total_moves']}")
+        if "illegal_game_rate" in results:
+            print(f"Games with illegal action: {results['illegal_game_rate']*100:.1f}%")
+        if results.get("mean_first_illegal_score") is not None:
+            print(f"Mean score at first illegal: {results['mean_first_illegal_score']:.1f}")
         print(f"Mean steps: {results['mean_steps']:.1f}")
 
         print("\n" + "=" * 50)

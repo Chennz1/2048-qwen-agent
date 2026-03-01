@@ -289,14 +289,6 @@ python -m src.eval.agent_eval \
   --output_dir data/eval_agents/llm_thinking_off
 ```
 
-也可以用一键脚本批量执行（规则 + 随机 + LLM开/关）：
-
-```bash
-bash scripts/evaluate_three_agents.sh \
-  --model_path checkpoints/sft \
-  --seed 42
-```
-
 ## 推荐文档
 
 1. 工作流总览：`docs/workflow/00_WORKFLOW_INDEX.md`

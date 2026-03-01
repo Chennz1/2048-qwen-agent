@@ -6,10 +6,11 @@ Generates training data using various heuristic strategies.
 import json
 import random
 import argparse
+import ast
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Literal, Optional, Tuple
+from typing import Any, List, Dict, Literal, Optional, Tuple
 import numpy as np
 
 from src.envs.game_2048 import Game2048, ACTION_MAP
@@ -260,6 +261,177 @@ class Expectimax2048Policy:
                 best_action = action
 
         return best_action
+
+
+def _game_from_state_text(state_text: str) -> Optional[Game2048]:
+    """Parse serialized 4x4 state text to Game2048."""
+    if not state_text:
+        return None
+    try:
+        grid = np.array(ast.literal_eval(state_text), dtype=int)
+    except Exception:
+        return None
+    if grid.shape != (4, 4):
+        return None
+
+    game = Game2048()
+    game.grid = grid
+    game.score = 0
+    game.game_over = False
+    return game
+
+
+def _board_potential_score_for_gap(grid: np.ndarray, valid_actions: List[int]) -> float:
+    """Lightweight board potential used for action-gap filtering."""
+    empty_cells = int(np.sum(grid == 0))
+    smoothness = Expectimax2048Policy._smoothness_penalty(grid)
+    monotonicity = Expectimax2048Policy._monotonicity(grid)
+    merge_potential = Expectimax2048Policy._merge_potential(grid)
+    corner_bonus = Expectimax2048Policy._max_in_corner_bonus(grid)
+    mobility = len(valid_actions)
+
+    return (
+        empty_cells * 1.8
+        + monotonicity * 0.9
+        - smoothness * 0.8
+        + merge_potential * 1.4
+        + corner_bonus * 1.5
+        + mobility * 0.4
+    )
+
+
+def _estimate_action_gap(state_text: str) -> float:
+    """Estimate action gap: top1(Q)-top2(Q) over legal actions."""
+    game = _game_from_state_text(state_text)
+    if game is None:
+        return float("inf")
+
+    valid_actions = game.get_valid_actions()
+    if len(valid_actions) < 2:
+        return float("inf")
+
+    q_values: List[float] = []
+    for action in valid_actions:
+        test_game = game.clone()
+        prev_score = test_game.score
+        test_game._move(action)
+        score_gain = float(test_game.score - prev_score)
+        next_valid_actions = test_game.get_valid_actions()
+        q_values.append(score_gain + _board_potential_score_for_gap(test_game.grid, next_valid_actions))
+
+    if len(q_values) < 2:
+        return float("inf")
+    q_values.sort(reverse=True)
+    return float(q_values[0] - q_values[1])
+
+
+def _gap_keep_probability(
+    *,
+    gap: float,
+    step: int,
+    gap_low: float,
+    gap_mid: float,
+    keep_low: float,
+    keep_mid: float,
+    keep_high: float,
+    early_step: int,
+    early_factor: float,
+) -> Tuple[str, float]:
+    if gap <= gap_low:
+        bucket = "low"
+        keep_prob = keep_low
+    elif gap <= gap_mid:
+        bucket = "mid"
+        keep_prob = keep_mid
+    else:
+        bucket = "high"
+        keep_prob = keep_high
+
+    if step < early_step:
+        keep_prob *= early_factor
+
+    keep_prob = min(1.0, max(0.0, float(keep_prob)))
+    return bucket, keep_prob
+
+
+def _apply_gap_filter_to_game(
+    game_data: Dict[str, Any],
+    *,
+    rng: random.Random,
+    gap_low: float,
+    gap_mid: float,
+    keep_low: float,
+    keep_mid: float,
+    keep_high: float,
+    early_step: int,
+    early_factor: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Filter one game's step records using action-gap keep probabilities."""
+    states = list(game_data.get("states", []))
+    if not states:
+        return game_data, {"before_steps": 0, "after_steps": 0}
+
+    records: List[Tuple[Dict[str, Any], float]] = []
+    bucket_total = {"low": 0, "mid": 0, "high": 0}
+    bucket_kept = {"low": 0, "mid": 0, "high": 0}
+    kept_states: List[Dict[str, Any]] = []
+
+    for state in states:
+        step = int(state.get("step", 0))
+        gap = _estimate_action_gap(state.get("state", ""))
+        bucket, keep_prob = _gap_keep_probability(
+            gap=gap,
+            step=step,
+            gap_low=gap_low,
+            gap_mid=gap_mid,
+            keep_low=keep_low,
+            keep_mid=keep_mid,
+            keep_high=keep_high,
+            early_step=early_step,
+            early_factor=early_factor,
+        )
+        bucket_total[bucket] += 1
+        records.append((state, gap))
+        if rng.random() <= keep_prob:
+            kept_states.append(state)
+            bucket_kept[bucket] += 1
+
+    # Keep at least one step to satisfy raw-data contract.
+    if not kept_states and records:
+        keep_state, keep_gap = max(records, key=lambda x: x[1])
+        kept_states = [keep_state]
+        keep_bucket, _ = _gap_keep_probability(
+            gap=keep_gap,
+            step=int(keep_state.get("step", 0)),
+            gap_low=gap_low,
+            gap_mid=gap_mid,
+            keep_low=keep_low,
+            keep_mid=keep_mid,
+            keep_high=keep_high,
+            early_step=early_step,
+            early_factor=early_factor,
+        )
+        bucket_kept[keep_bucket] += 1
+
+    reindexed: List[Dict[str, Any]] = []
+    for idx, state in enumerate(kept_states):
+        new_state = dict(state)
+        new_state["step"] = idx
+        reindexed.append(new_state)
+
+    game_data["states"] = reindexed
+    game_data["total_steps"] = len(reindexed)
+    game_data["gap_filter_applied"] = True
+    game_data["gap_filter_before_steps"] = len(states)
+    game_data["gap_filter_after_steps"] = len(reindexed)
+
+    stats = {
+        "before_steps": len(states),
+        "after_steps": len(reindexed),
+        "bucket_total": bucket_total,
+        "bucket_kept": bucket_kept,
+    }
+    return game_data, stats
 
 
 class CoTDiversityGenerator:
@@ -1221,6 +1393,14 @@ def generate_games(
     enable_diversity: bool = True,
     expert_depth: int = 2,
     expert_max_empty: int = 8,
+    gap_filter: bool = True,
+    gap_low: float = 2.0,
+    gap_mid: float = 4.0,
+    keep_low: float = 0.10,
+    keep_mid: float = 0.30,
+    keep_high: float = 1.00,
+    early_step: int = 80,
+    early_factor: float = 0.50,
 ) -> List[Dict]:
     """
     Generate training games.
@@ -1234,6 +1414,14 @@ def generate_games(
         enable_diversity: Compatibility flag (CoT diversity is always enabled)
         expert_depth: expectimax搜索深度（仅expert难度生效）
         expert_max_empty: chance节点最大空位分支数（仅expert难度生效）
+        gap_filter: 是否在生成阶段按 action_gap 过滤状态
+        gap_low: gap低桶阈值（<=）
+        gap_mid: gap中桶阈值（<=）
+        keep_low: 低gap保留率
+        keep_mid: 中gap保留率
+        keep_high: 高gap保留率
+        early_step: 早期步数阈值（step < early_step）
+        early_factor: 早期样本保留率乘子
 
     Returns:
         List of games, each containing states, actions, final_score, max_tile
@@ -1263,6 +1451,13 @@ def generate_games(
         )
 
     games = []
+    gap_filter_rng = random.Random(seed if seed is not None else 0)
+    gap_filter_summary = {
+        "before_steps": 0,
+        "after_steps": 0,
+        "bucket_total": {"low": 0, "mid": 0, "high": 0},
+        "bucket_kept": {"low": 0, "mid": 0, "high": 0},
+    }
 
     for game_idx in range(num_games):
         # 每个游戏使用独立的种子，基于初始种子
@@ -1322,10 +1517,42 @@ def generate_games(
 
             game_data['states'].append(state_data)
 
+        if gap_filter:
+            game_data, step_stats = _apply_gap_filter_to_game(
+                game_data,
+                rng=gap_filter_rng,
+                gap_low=gap_low,
+                gap_mid=gap_mid,
+                keep_low=keep_low,
+                keep_mid=keep_mid,
+                keep_high=keep_high,
+                early_step=early_step,
+                early_factor=early_factor,
+            )
+            gap_filter_summary["before_steps"] += int(step_stats["before_steps"])
+            gap_filter_summary["after_steps"] += int(step_stats["after_steps"])
+            for key in ("low", "mid", "high"):
+                gap_filter_summary["bucket_total"][key] += int(step_stats["bucket_total"][key])
+                gap_filter_summary["bucket_kept"][key] += int(step_stats["bucket_kept"][key])
+
         games.append(game_data)
 
         if (game_idx + 1) % 1000 == 0:
             print(f"Generated {game_idx + 1}/{num_games} games")
+
+    if gap_filter:
+        before_steps = int(gap_filter_summary["before_steps"])
+        after_steps = int(gap_filter_summary["after_steps"])
+        print(
+            "[GapFilter] steps: "
+            f"{before_steps} -> {after_steps} "
+            f"(keep={after_steps / max(before_steps, 1):.3f})"
+        )
+        for key in ("low", "mid", "high"):
+            total = int(gap_filter_summary["bucket_total"][key])
+            kept = int(gap_filter_summary["bucket_kept"][key])
+            keep_rate = kept / max(total, 1)
+            print(f"[GapFilter] {key}: {kept}/{total} ({keep_rate:.3f})")
 
     return games
 
@@ -1337,6 +1564,14 @@ def generate_mixed_data(
     enable_diversity: bool = True,
     expert_depth: int = 2,
     expert_max_empty: int = 8,
+    gap_filter: bool = True,
+    gap_low: float = 2.0,
+    gap_mid: float = 4.0,
+    keep_low: float = 0.10,
+    keep_mid: float = 0.30,
+    keep_high: float = 1.00,
+    early_step: int = 80,
+    early_factor: float = 0.50,
 ) -> List[Dict]:
     """
     Generate mixed difficulty data.
@@ -1348,6 +1583,14 @@ def generate_mixed_data(
         enable_diversity: Compatibility flag (CoT diversity is always enabled)
         expert_depth: expectimax搜索深度（mixed中若包含expert时生效）
         expert_max_empty: chance节点最大空位分支数
+        gap_filter: 是否在生成阶段按 action_gap 过滤状态
+        gap_low: gap低桶阈值（<=）
+        gap_mid: gap中桶阈值（<=）
+        keep_low: 低gap保留率
+        keep_mid: 中gap保留率
+        keep_high: 高gap保留率
+        early_step: 早期步数阈值（step < early_step）
+        early_factor: 早期样本保留率乘子
 
     Returns:
         List of games with mixed difficulty levels
@@ -1376,6 +1619,14 @@ def generate_mixed_data(
             enable_diversity=enable_diversity,
             expert_depth=expert_depth,
             expert_max_empty=expert_max_empty,
+            gap_filter=gap_filter,
+            gap_low=gap_low,
+            gap_mid=gap_mid,
+            keep_low=keep_low,
+            keep_mid=keep_mid,
+            keep_high=keep_high,
+            early_step=early_step,
+            early_factor=early_factor,
         )
         all_games.extend(games)
         seed_offset += n  # 增加偏移量
@@ -1518,6 +1769,14 @@ def build_generation_manifest(
             "enable_diversity": args.enable_diversity,
             "expert_depth": getattr(args, "expert_depth", 2),
             "expert_max_empty": getattr(args, "expert_max_empty", 8),
+            "gap_filter": bool(getattr(args, "gap_filter", False)),
+            "gap_low": float(getattr(args, "gap_low", 2.0)),
+            "gap_mid": float(getattr(args, "gap_mid", 4.0)),
+            "keep_low": float(getattr(args, "keep_low", 0.10)),
+            "keep_mid": float(getattr(args, "keep_mid", 0.30)),
+            "keep_high": float(getattr(args, "keep_high", 1.00)),
+            "early_step": int(getattr(args, "early_step", 80)),
+            "early_factor": float(getattr(args, "early_factor", 0.50)),
             "min_final_score": args.min_final_score,
             "min_steps": args.min_steps,
             "min_unique_state_ratio": args.min_unique_state_ratio,
@@ -1586,6 +1845,25 @@ def main():
                         help='expert策略expectimax搜索深度（默认2）')
     parser.add_argument('--expert_max_empty', type=int, default=8,
                         help='expert策略chance节点最大空位分支数（默认8）')
+    parser.add_argument('--gap_filter', dest='gap_filter', action='store_true',
+                        help='生成阶段按 action_gap 分段概率过滤状态（默认开启）')
+    parser.add_argument('--no_gap_filter', dest='gap_filter', action='store_false',
+                        help='关闭生成阶段 action_gap 过滤')
+    parser.set_defaults(gap_filter=True)
+    parser.add_argument('--gap_low', type=float, default=2.0,
+                        help='gap 低桶阈值（<=）')
+    parser.add_argument('--gap_mid', type=float, default=4.0,
+                        help='gap 中桶阈值（<=）')
+    parser.add_argument('--keep_low', type=float, default=0.10,
+                        help='低 gap 桶保留率')
+    parser.add_argument('--keep_mid', type=float, default=0.30,
+                        help='中 gap 桶保留率')
+    parser.add_argument('--keep_high', type=float, default=1.00,
+                        help='高 gap 桶保留率')
+    parser.add_argument('--early_step', type=int, default=80,
+                        help='早期步数阈值（step < early_step）')
+    parser.add_argument('--early_factor', type=float, default=0.50,
+                        help='早期样本保留率乘子')
     parser.add_argument('--min_final_score', type=int, default=0,
                         help='过滤低质量对局：最低最终分数（默认0，不过滤）')
     parser.add_argument('--min_steps', type=int, default=1,
@@ -1610,19 +1888,49 @@ def main():
     print("  CoT多样性: True (fixed)")
     print(f"  Expert搜索深度: {args.expert_depth}")
     print(f"  Expert空位分支上限: {args.expert_max_empty}")
+    print(f"  Gap过滤: {args.gap_filter}")
+    if args.gap_filter:
+        print(f"    gap_low: {args.gap_low}")
+        print(f"    gap_mid: {args.gap_mid}")
+        print(f"    keep_low: {args.keep_low}")
+        print(f"    keep_mid: {args.keep_mid}")
+        print(f"    keep_high: {args.keep_high}")
+        print(f"    early_step: {args.early_step}")
+        print(f"    early_factor: {args.early_factor}")
     print(f"  最低最终分数: {args.min_final_score}")
     print(f"  最低步数: {args.min_steps}")
     print(f"  最小唯一状态比例: {args.min_unique_state_ratio}")
     print()
 
+    if args.gap_low > args.gap_mid:
+        raise ValueError("--gap_low 必须 <= --gap_mid")
+    for value, name in (
+        (args.keep_low, "keep_low"),
+        (args.keep_mid, "keep_mid"),
+        (args.keep_high, "keep_high"),
+        (args.early_factor, "early_factor"),
+    ):
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"--{name} 必须在 [0,1] 区间")
+    if args.early_step < 0:
+        raise ValueError("--early_step 必须 >= 0")
+
     if args.difficulty == 'mixed':
         games = generate_mixed_data(
-            args.num_games,
-            args.seed,
-            args.with_thinking,
-            args.enable_diversity,
-            args.expert_depth,
-            args.expert_max_empty,
+            total_games=args.num_games,
+            seed=args.seed,
+            with_thinking=args.with_thinking,
+            enable_diversity=args.enable_diversity,
+            expert_depth=args.expert_depth,
+            expert_max_empty=args.expert_max_empty,
+            gap_filter=args.gap_filter,
+            gap_low=args.gap_low,
+            gap_mid=args.gap_mid,
+            keep_low=args.keep_low,
+            keep_mid=args.keep_mid,
+            keep_high=args.keep_high,
+            early_step=args.early_step,
+            early_factor=args.early_factor,
         )
     else:
         games = generate_games(
@@ -1633,6 +1941,14 @@ def main():
             enable_diversity=args.enable_diversity,
             expert_depth=args.expert_depth,
             expert_max_empty=args.expert_max_empty,
+            gap_filter=args.gap_filter,
+            gap_low=args.gap_low,
+            gap_mid=args.gap_mid,
+            keep_low=args.keep_low,
+            keep_mid=args.keep_mid,
+            keep_high=args.keep_high,
+            early_step=args.early_step,
+            early_factor=args.early_factor,
         )
 
     # Lightweight quality filtering

@@ -5,6 +5,7 @@ Implementation of the 2048 game logic for training LLMs.
 
 import numpy as np
 import random
+import re
 from typing import Tuple, List, Optional
 
 
@@ -29,6 +30,109 @@ ACTION_NAMES_CHI = {
     "下": 2,
     "左": 3
 }
+
+_ACTION_TOKEN_TO_ID = {
+    "上": 0,
+    "右": 1,
+    "下": 2,
+    "左": 3,
+    "up": 0,
+    "right": 1,
+    "down": 2,
+    "left": 3,
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+}
+
+_TRAILING_TEMPLATE_TOKEN_RE = re.compile(
+    r"(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+\s*$"
+)
+_TRAILING_CHI_RE = re.compile(r"([上右下左])\s*$")
+_TRAILING_ID_RE = re.compile(r"([0-3])\s*$")
+_TRAILING_ENG_RE = re.compile(r"\b(up|right|down|left)\b\s*$", flags=re.I)
+_TRAILING_PUNCT_RE = re.compile(r"[\s,，。:：;；!！?？~…]+$")
+_THINK_CLOSE_RE = re.compile(r"</think>", flags=re.I)
+_THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.I)
+_FINAL_ACTION_CLAIM_RE = re.compile(
+    r"(?:最终|最后|选择|动作|着法|action|move)\s*(?:为|是|向|:|：)?\s*([上右下左]|[0-3]|up|right|down|left)",
+    flags=re.I,
+)
+_DIRECTION_PHRASE_RE = re.compile(r"(?:向|往|朝)\s*([上右下左])")
+
+
+def _normalize_action_text(text: str) -> str:
+    normalized = (text or "").rstrip()
+    while True:
+        stripped = _TRAILING_TEMPLATE_TOKEN_RE.sub("", normalized)
+        if stripped == normalized:
+            break
+        normalized = stripped.rstrip()
+    return normalized
+
+
+def _decode_action_token(token: str) -> Optional[int]:
+    token_norm = str(token).strip().lower()
+    if not token_norm:
+        return None
+    return _ACTION_TOKEN_TO_ID.get(token_norm)
+
+
+def _extract_non_think_output(text: str) -> str:
+    normalized = _normalize_action_text(text)
+    if not normalized:
+        return ""
+
+    closes = list(_THINK_CLOSE_RE.finditer(normalized))
+    if closes:
+        return normalized[closes[-1].end():].strip()
+
+    return _THINK_BLOCK_RE.sub("", normalized).strip()
+
+
+def parse_action_from_non_think_text(text: str) -> Optional[int]:
+    """Parse action from non-think output only.
+
+    Returns None when non-think region is empty or action cannot be parsed.
+    """
+    candidate = _extract_non_think_output(text)
+    if not candidate:
+        return None
+
+    candidate = _TRAILING_PUNCT_RE.sub("", candidate.strip())
+    if not candidate:
+        return None
+
+    direct = _decode_action_token(candidate)
+    if direct is not None:
+        return int(direct)
+
+    final_claims = _FINAL_ACTION_CLAIM_RE.findall(candidate)
+    if final_claims:
+        claimed = _decode_action_token(final_claims[-1])
+        if claimed is not None:
+            return int(claimed)
+
+    direction_phrases = _DIRECTION_PHRASE_RE.findall(candidate)
+    if direction_phrases:
+        return int(ACTION_NAMES_CHI[direction_phrases[-1]])
+
+    trailing_match = _TRAILING_CHI_RE.search(candidate)
+    if trailing_match:
+        return int(ACTION_NAMES_CHI[trailing_match.group(1)])
+
+    trailing_id = _TRAILING_ID_RE.search(candidate)
+    if trailing_id:
+        return int(trailing_id.group(1))
+
+    trailing_eng = _TRAILING_ENG_RE.search(candidate)
+    if trailing_eng:
+        decoded = _decode_action_token(trailing_eng.group(1))
+        if decoded is not None:
+            return int(decoded)
+
+    return None
 
 
 class Game2048:
@@ -306,17 +410,29 @@ def parse_action_from_text(text: str) -> int:
     Returns:
         Action ID (0-3), defaults to 0 if not found
     """
-    text_lower = text.lower()
+    non_think_action = parse_action_from_non_think_text(text)
+    if non_think_action is not None:
+        return int(non_think_action)
 
-    # Check English
-    for eng_name, action_id in ACTION_NAMES_ENG.items():
-        if eng_name in text_lower:
-            return action_id
+    candidate = _normalize_action_text(text)
 
-    # Check Chinese
-    for chi_name, action_id in ACTION_NAMES_CHI.items():
-        if chi_name in text:
-            return action_id
+    direct = _decode_action_token(candidate)
+    if direct is not None:
+        return int(direct)
+
+    trailing_match = _TRAILING_CHI_RE.search(candidate)
+    if trailing_match:
+        return int(ACTION_NAMES_CHI[trailing_match.group(1)])
+
+    trailing_id = _TRAILING_ID_RE.search(candidate)
+    if trailing_id:
+        return int(trailing_id.group(1))
+
+    trailing_eng = _TRAILING_ENG_RE.search(candidate)
+    if trailing_eng:
+        decoded = _decode_action_token(trailing_eng.group(1))
+        if decoded is not None:
+            return int(decoded)
 
     # Default to up (0)
     return 0

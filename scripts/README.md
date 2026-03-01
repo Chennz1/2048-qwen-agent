@@ -10,10 +10,10 @@
 pip install -r requirements.txt
 ```
 
-建议先做环境体检:
+建议先做最小验证:
 
 ```bash
-bash scripts/doctor.sh
+pytest -q tests
 ```
 
 ## 2) 先跑最小闭环（推荐）
@@ -141,10 +141,7 @@ bash scripts/train_sft_grpo.sh --monitor_backend none
 ## 5) 日常开发常用脚本
 
 ```bash
-bash scripts/lint.sh
-bash scripts/typecheck.sh
-bash scripts/test.sh
-bash scripts/ci_local.sh --skip-smoke
+pytest -q tests
 ```
 
 ## 6) 结果怎么看

@@ -31,7 +31,7 @@ os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 from transformers import AutoTokenizer
 
 from src.data_gen.prompting import format_inference_prompt
-from src.envs.game_2048 import ACTION_MAP, Game2048
+from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_non_think_text
 from src.utils.action_stats import ActionWindowStats
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
 
@@ -809,7 +809,7 @@ class TRLGRPO2048Trainer:
         self,
         dataset: Dataset,
         tokenizer: Optional[Any] = None,
-        learning_rate: float = 5e-6,
+        learning_rate: float = 1e-6,
         warmup_ratio: float = 0.03,
         lr_scheduler_type: str = "cosine",
         clip_eps: float = 0.28,
@@ -922,38 +922,17 @@ def _parse_action_id(text: str) -> Optional[int]:
 
 
 def _parse_action_id_with_quality(text: str) -> Tuple[Optional[int], float]:
-    """Parse action and return (action_id, format_quality in [0,1])."""
+    """Parse action from non-think output and return (action_id, format_quality in [0,1])."""
     normalized = _normalize_completion_text(text)
 
     strict = _parse_strict_action_id(normalized)
     if strict is not None:
         return strict, 1.0
 
-    hinted_char = _ACTION_CHAR_HINT_RE.search(normalized)
-    if hinted_char:
-        return _ACTION_CHAR_TO_ID.get(hinted_char.group(1)), 0.8
-
-    hinted_id = _ACTION_ID_HINT_RE.search(normalized)
-    if hinted_id:
-        return int(hinted_id.group(1)), 0.75
-
-    tail_char = _TRAILING_ACTION_CHAR_RE.search(normalized)
-    if tail_char:
-        return _ACTION_CHAR_TO_ID.get(tail_char.group(1)), 0.65
-
-    tail_id = _TRAILING_ACTION_ID_RE.search(normalized)
-    if tail_id:
-        return int(tail_id.group(1)), 0.6
-
-    words = _ACTION_WORD_RE.findall(normalized)
-    if words:
-        return _ACTION_WORD_TO_ID.get(words[-1].lower()), 0.55
-
-    # Last-resort recovery: if model outputs multiple directions in analysis text,
-    # prefer the final one as the final decision token.
-    chars = [ch for ch in normalized if ch in _ACTION_CHAR_TO_ID]
-    if chars:
-        return _ACTION_CHAR_TO_ID.get(chars[-1]), 0.4
+    parsed = parse_action_from_non_think_text(normalized)
+    if parsed is not None:
+        # Parsed from non-think region but not strict single-token format.
+        return int(parsed), 0.8
 
     return None, 0.0
 

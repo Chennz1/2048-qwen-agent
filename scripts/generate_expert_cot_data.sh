@@ -11,6 +11,7 @@
 #   --expert_depth <int>           expectimax 搜索深度。默认: 2
 #   --expert_max_empty <int>       expectimax 空位分支上限。默认: 8
 #   --no_diversity                 关闭策略多样性增强（默认开启）
+#   --no_gap_filter                关闭生成阶段 gap 过滤（默认开启）
 #
 # 说明:
 #   本脚本固定使用:
@@ -31,6 +32,7 @@ SEED=42
 EXPERT_DEPTH=2
 EXPERT_MAX_EMPTY=8
 ENABLE_DIVERSITY=true
+GAP_FILTER=true
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -46,6 +48,8 @@ while [[ $# -gt 0 ]]; do
       EXPERT_MAX_EMPTY="$2"; shift 2 ;;
     --no_diversity)
       ENABLE_DIVERSITY=false; shift ;;
+    --no_gap_filter)
+      GAP_FILTER=false; shift ;;
     *)
       echo "Unknown arg: $1"; exit 1 ;;
   esac
@@ -60,6 +64,7 @@ echo "  seed: $SEED"
 echo "  expert_depth: $EXPERT_DEPTH"
 echo "  expert_max_empty: $EXPERT_MAX_EMPTY"
 echo "  enable_diversity: $ENABLE_DIVERSITY"
+echo "  gap_filter: $GAP_FILTER"
 echo ""
 
 python -m src.data_gen.generator \
@@ -70,6 +75,7 @@ python -m src.data_gen.generator \
   --seed "$SEED" \
   --expert_depth "$EXPERT_DEPTH" \
   --expert_max_empty "$EXPERT_MAX_EMPTY" \
+  $( [ "$GAP_FILTER" = false ] && echo "--no_gap_filter" ) \
   $( [ "$ENABLE_DIVERSITY" = false ] && echo "--no_enable_diversity" )
 
 echo ""

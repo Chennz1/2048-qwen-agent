@@ -272,7 +272,7 @@ def _build_sft_config(
         "learning_rate": learning_rate,
         "warmup_ratio": 0.1,
         "lr_scheduler_type": "cosine",
-        "disable_tqdm": False,
+        "disable_tqdm": True,
         "logging_steps": 4,
         "save_strategy": "epoch",
         "save_total_limit": 3,
@@ -661,7 +661,7 @@ def train_with_custom_reward(
 
     # PPO配置
     ppo_config = PPOConfig(
-        learning_rate=1.41e-5,
+        learning_rate=1e-5,
         batch_size=128,
         mini_batch_size=32,
         gradient_accumulation_steps=4,
