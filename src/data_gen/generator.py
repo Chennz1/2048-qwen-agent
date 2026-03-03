@@ -443,28 +443,22 @@ class CoTDiversityGenerator:
     """
 
     # 位置描述模板
-    POSITION_TEMPLATES = [
-        "最大数字{tile}在{pos}",
-        "{tile}位于{pos}",
-        "当前最大数字为{tile}，位置在{pos}",
-        "棋盘上最大的数字是{tile}，处于{pos}",
-        "{pos}有最大数字{tile}",
+    POSITION_CORNER_TEMPLATES = [
+        "当前最大数字是{tile}，位于{corner}",
+        "棋盘上最大块是{tile}，位置在{corner}",
+        "最大数字{tile}在{corner}",
+        "最大块{tile}稳定在{corner}",
     ]
-
-    # 角落位置模板
-    CORNER_TEMPLATES = [
-        "{corner}",
-        "位于{corner}",
-        "在{corner}位置",
-        "占据了{corner}",
+    POSITION_NON_CORNER_TEMPLATES = [
+        "当前最大数字是{tile}，位于{pos}，尚未入角",
+        "最大数字{tile}在{pos}，目前不在角落",
+        "棋盘上最大块{tile}处于{pos}，需要考虑入角",
+        "最大数字{tile}位于{pos}，角落基座尚未建立",
     ]
-
-    # 非角落位置模板
-    NON_CORNER_TEMPLATES = [
-        "在位置{pos}",
-        "位于{pos}",
-        "不在角落（位置{pos}）",
-        "处于{pos}",
+    POSITION_MULTI_MAX_TEMPLATES = [
+        "当前最大数字{tile}共有{count}个，分别位于{positions}",
+        "棋盘上最大块{tile}出现了{count}次，位置是{positions}",
+        "最大数字{tile}不止一个（{count}个），分布在{positions}",
     ]
 
     # 策略描述模板（保持基座）
@@ -524,6 +518,107 @@ class CoTDiversityGenerator:
         "空位不多（{count}格），需要仔细考虑",
     ]
 
+    LEGALITY_HEADER_TEMPLATES = [
+        "第一步：判断上下左右是否合法",
+        "第一步：逐项判定上/右/下/左是否合法",
+        "第一步：先做合法性判断",
+    ]
+    LEGALITY_ITEM_LEGAL_TEMPLATES = [
+        "{action}：{reason}，是合法动作",
+        "{action}：{reason}，因此是合法动作",
+        "{action}：{reason}，判定为合法动作",
+    ]
+    LEGALITY_ITEM_ILLEGAL_TEMPLATES = [
+        "{action}：{reason}，不是合法动作",
+        "{action}：{reason}，因此不是合法动作",
+        "{action}：{reason}，判定为非法动作",
+    ]
+    LEGALITY_SUMMARY_TEMPLATES = [
+        "第二步：可行动作为{{{actions}}}",
+        "第二步：由合法性判断得到可行动作{{{actions}}}",
+        "第二步：可行动作集合 = {{{actions}}}",
+    ]
+    LEGALITY_REASON_MOVE_EVIDENCE_TEMPLATES = [
+        "在{line_name} {before_line}->{after_line}，发生位移",
+        "在{line_name}从{before_line}变为{after_line}，出现滑动",
+        "在{line_name} {before_line}->{after_line}，棋盘发生位移变化",
+    ]
+    LEGALITY_REASON_MERGE_EVIDENCE_TEMPLATES = [
+        "在{line_name} {before_line}->{after_line}，发生合并（+{gain}分）",
+        "在{line_name}从{before_line}变为{after_line}，触发合并并得分+{gain}",
+        "在{line_name} {before_line}->{after_line}，存在合并收益（+{gain}分）",
+    ]
+    LEGALITY_REASON_ILLEGAL_EVIDENCE_TEMPLATES = [
+        "该方向下{scope}均保持不变，棋盘整体无变化",
+        "执行后{scope}都没有变化，因此棋盘不变",
+        "该方向没有任何滑动或合并，{scope}全部不变",
+    ]
+    EVAL_HEADER_TEMPLATES = [
+        "第三步：在可行动作中比较最优动作",
+        "第三步：仅在可行动作里评估并选择最优方向",
+        "第三步：从可行动作集合中挑选最优动作",
+    ]
+    EVAL_ITEM_TEMPLATES = [
+        "评估{action}：{merge_text}，{space_text}，{corner_text}，{mono_text}",
+        "{action}方向：{merge_text}，{space_text}，{corner_text}，{mono_text}",
+        "看{action}：{merge_text}；{space_text}；{corner_text}；{mono_text}",
+    ]
+    MERGE_EFFECT_GAIN_TEMPLATES = [
+        "可即时合并（+{gain}分）",
+        "当前有直接合并收益（+{gain}分）",
+        "存在即时合并，得分增加{gain}",
+    ]
+    MERGE_EFFECT_NONE_TEMPLATES = [
+        "无即时合并",
+        "当前没有直接合并收益",
+        "本步不产生即时合并",
+    ]
+    SPACE_EFFECT_TEMPLATES = [
+        "空位变化{delta}",
+        "空位增量为{delta}",
+        "执行后空位变化{delta}",
+    ]
+    CORNER_EFFECT_KEEP_TEMPLATES = [
+        "最大块继续保持在{corner}",
+        "角落基座保持在{corner}",
+        "仍能稳住{corner}的最大块",
+    ]
+    CORNER_EFFECT_BREAK_TEMPLATES = [
+        "会削弱{corner}角落基座",
+        "可能把最大块从{corner}移开",
+        "存在破坏{corner}锚点的风险",
+    ]
+    CORNER_EFFECT_TO_CORNER_TEMPLATES = [
+        "可将最大块推进到{corner}",
+        "有助于把最大块送入{corner}",
+        "最大块可向{corner}聚拢",
+    ]
+    CORNER_EFFECT_NEUTRAL_TEMPLATES = [
+        "对角落结构影响中性",
+        "角落结构收益有限",
+        "角落稳定性无明显改善",
+    ]
+    MONO_EFFECT_UP_TEMPLATES = [
+        "单调性上升",
+        "棋形单调结构得到改善",
+        "单调布局更稳定",
+    ]
+    MONO_EFFECT_DOWN_TEMPLATES = [
+        "单调性下降",
+        "单调结构被削弱",
+        "棋盘有序度下降",
+    ]
+    MONO_EFFECT_FLAT_TEMPLATES = [
+        "单调性基本持平",
+        "单调结构变化不大",
+        "棋形有序度基本不变",
+    ]
+    REJECT_REASON_TEMPLATES = [
+        "不选{action}，因为{reason}",
+        "放弃{action}，主要原因是{reason}",
+        "没有选择{action}，理由：{reason}",
+    ]
+
     def __init__(self, seed: int = None):
         """
         初始化多样性生成器
@@ -580,32 +675,22 @@ class CoTDiversityGenerator:
             corner_name: 角落名称（如果在角落）
         """
         if in_corner and corner_name:
-            # 在角落的情况
-            pos_template = self._random_choice(self.CORNER_TEMPLATES)
-            position_desc = pos_template.format(corner=corner_name)
+            template = self._random_choice(self.POSITION_CORNER_TEMPLATES)
+            return template.format(tile=max_tile, corner=corner_name)
 
-            base_templates = self.POSITION_TEMPLATES
-            base_template = self._random_choice(base_templates)
+        pos_desc = self._format_position(max_pos)
+        template = self._random_choice(self.POSITION_NON_CORNER_TEMPLATES)
+        return template.format(tile=max_tile, pos=pos_desc)
 
-            # 组合
-            variations = [
-                base_template.format(tile=max_tile, pos=position_desc),
-                f"{max_tile}{position_desc}",
-                f"{corner_name}有{max_tile}",
-            ]
-            return self._random_choice(variations)
-        else:
-            # 不在角落的情况
-            pos_desc = self._format_position(max_pos)
-
-            base_templates = self.POSITION_TEMPLATES
-            base_template = self._random_choice(base_templates)
-
-            variations = [
-                base_template.format(tile=max_tile, pos=pos_desc),
-                f"{max_tile}{pos_desc}",
-            ]
-            return self._random_choice(variations)
+    def generate_multi_max_description(
+        self,
+        max_tile: int,
+        count: int,
+        positions: List[tuple[int, int]],
+    ) -> str:
+        pos_text = "、".join(self._format_position(pos) for pos in positions)
+        template = self._random_choice(self.POSITION_MULTI_MAX_TEMPLATES)
+        return template.format(tile=max_tile, count=count, positions=pos_text)
 
     def generate_strategy_description(
         self,
@@ -690,6 +775,107 @@ class CoTDiversityGenerator:
             return template.format(count=empty_count)
         return ""
 
+    def generate_legality_header(self) -> str:
+        return self._random_choice(self.LEGALITY_HEADER_TEMPLATES)
+
+    def generate_legality_item(self, action_name: str, legal: bool, reason: str) -> str:
+        if legal:
+            template = self._random_choice(self.LEGALITY_ITEM_LEGAL_TEMPLATES)
+        else:
+            template = self._random_choice(self.LEGALITY_ITEM_ILLEGAL_TEMPLATES)
+        return template.format(action=action_name, reason=reason)
+
+    def generate_legality_summary(self, legal_actions_text: str) -> str:
+        template = self._random_choice(self.LEGALITY_SUMMARY_TEMPLATES)
+        return template.format(actions=legal_actions_text)
+
+    def generate_legality_reason(
+        self,
+        *,
+        legal: bool,
+        score_gain: int,
+        line_name: str,
+        before_line: str,
+        after_line: str,
+        scope: str,
+    ) -> str:
+        if not legal:
+            template = self._random_choice(self.LEGALITY_REASON_ILLEGAL_EVIDENCE_TEMPLATES)
+            return template.format(scope=scope)
+        if score_gain > 0:
+            template = self._random_choice(self.LEGALITY_REASON_MERGE_EVIDENCE_TEMPLATES)
+            return template.format(
+                line_name=line_name,
+                before_line=before_line,
+                after_line=after_line,
+                gain=score_gain,
+            )
+        template = self._random_choice(self.LEGALITY_REASON_MOVE_EVIDENCE_TEMPLATES)
+        return template.format(
+            line_name=line_name,
+            before_line=before_line,
+            after_line=after_line,
+        )
+
+    def generate_eval_header(self) -> str:
+        return self._random_choice(self.EVAL_HEADER_TEMPLATES)
+
+    def generate_eval_item(
+        self,
+        action_name: str,
+        merge_text: str,
+        space_text: str,
+        corner_text: str,
+        mono_text: str,
+    ) -> str:
+        template = self._random_choice(self.EVAL_ITEM_TEMPLATES)
+        return template.format(
+            action=action_name,
+            merge_text=merge_text,
+            space_text=space_text,
+            corner_text=corner_text,
+            mono_text=mono_text,
+        )
+
+    def generate_reject_reason(self, action_name: str, reason: str) -> str:
+        template = self._random_choice(self.REJECT_REASON_TEMPLATES)
+        return template.format(action=action_name, reason=reason)
+
+    def generate_merge_effect(self, score_gain: int) -> str:
+        if score_gain > 0:
+            template = self._random_choice(self.MERGE_EFFECT_GAIN_TEMPLATES)
+            return template.format(gain=score_gain)
+        return self._random_choice(self.MERGE_EFFECT_NONE_TEMPLATES)
+
+    def generate_space_effect(self, empty_delta: int) -> str:
+        template = self._random_choice(self.SPACE_EFFECT_TEMPLATES)
+        return template.format(delta=f"{empty_delta:+d}")
+
+    def generate_corner_effect(
+        self,
+        *,
+        keep_corner: Optional[str] = None,
+        break_corner: Optional[str] = None,
+        move_to_corner: Optional[str] = None,
+    ) -> str:
+        if keep_corner:
+            template = self._random_choice(self.CORNER_EFFECT_KEEP_TEMPLATES)
+            return template.format(corner=keep_corner)
+        if break_corner:
+            template = self._random_choice(self.CORNER_EFFECT_BREAK_TEMPLATES)
+            return template.format(corner=break_corner)
+        if move_to_corner:
+            template = self._random_choice(self.CORNER_EFFECT_TO_CORNER_TEMPLATES)
+            return template.format(corner=move_to_corner)
+        return self._random_choice(self.CORNER_EFFECT_NEUTRAL_TEMPLATES)
+
+    def generate_mono_effect(self, mono_delta: float) -> str:
+        if mono_delta > 1e-6:
+            return self._random_choice(self.MONO_EFFECT_UP_TEMPLATES)
+        if mono_delta < -1e-6:
+            return self._random_choice(self.MONO_EFFECT_DOWN_TEMPLATES)
+        return self._random_choice(self.MONO_EFFECT_FLAT_TEMPLATES)
+
 
 
 class ThinkingHeuristicPlayer:
@@ -704,9 +890,9 @@ class ThinkingHeuristicPlayer:
     """
 
     SNAPSHOT_TEMPLATES = (
-        "最大数字{max_tile}，空位{empty_cells}个，可行动作：{valid_actions}",
-        "当前最大数字{max_tile}，空位{empty_cells}个，可行动作：{valid_actions}",
-        "棋盘关键信息：最大数字{max_tile}，空位{empty_cells}个，可行动作：{valid_actions}",
+        "最大数字{max_tile}，空位{empty_cells}个",
+        "当前最大数字{max_tile}，空位{empty_cells}个",
+        "棋盘关键信息：最大数字{max_tile}，空位{empty_cells}个",
     )
     CORNER_KEEP_TEMPLATES = (
         "最大数字{max_tile}在{corner}，该动作可以保持角落基座",
@@ -747,6 +933,37 @@ class ThinkingHeuristicPlayer:
         "最终选择向{action_name}移动",
         "最终决定向{action_name}移动",
         "综上，选择向{action_name}移动",
+    )
+    CORNER_NAMES = {
+        (0, 0): "左上角",
+        (0, 3): "右上角",
+        (3, 0): "左下角",
+        (3, 3): "右下角",
+    }
+    REJECT_MERGE_REASON_TEMPLATES = (
+        "该方向没有当前动作的合并收益",
+        "该方向的即时合并收益更低",
+        "该方向在本回合的得分收益更弱",
+    )
+    REJECT_CORNER_REASON_TEMPLATES = (
+        "该方向会破坏当前角落基座",
+        "该方向对角落稳定性更不利",
+        "该方向会增加最大块离角风险",
+    )
+    REJECT_SPACE_REASON_TEMPLATES = (
+        "该方向会减少更多空位，机动性更差",
+        "该方向的空间收益更弱",
+        "该方向会让后续可操作空间更紧张",
+    )
+    REJECT_MONO_REASON_TEMPLATES = (
+        "该方向会削弱棋盘单调结构",
+        "该方向的单调性表现更差",
+        "该方向不利于保持有序布局",
+    )
+    REJECT_GENERAL_REASON_TEMPLATES = (
+        "该方向综合收益更低",
+        "该方向在风险收益比上不占优",
+        "该方向的整体局面价值更弱",
     )
 
     def __init__(
@@ -821,13 +1038,10 @@ class ThinkingHeuristicPlayer:
 
     def _build_state_snapshot(self, game: Game2048) -> str:
         """Build a concise, high-information board summary for CoT."""
-        valid_actions = game.get_valid_actions()
-        valid_actions_text = "、".join(ACTION_MAP[a] for a in valid_actions) if valid_actions else "无"
         template = self._pick_template(self.SNAPSHOT_TEMPLATES)
         return template.format(
             max_tile=game.get_max_tile(),
             empty_cells=game.get_empty_cells(),
-            valid_actions=valid_actions_text,
         )
 
     def _finalize_thinking(self, parts: List[str], chosen_action: int) -> str:
@@ -860,100 +1074,82 @@ class ThinkingHeuristicPlayer:
         parts = [self._build_state_snapshot(game)]
         gen = self.diversity_generator
 
-        # 1. 分析最大数字位置
         max_tile = game.get_max_tile()
         max_pos = self._find_max_tile_position(game)
+        max_count = int(np.sum(game.grid == max_tile))
+        max_positions = [(r, c) for r in range(4) for c in range(4) if int(game.grid[r, c]) == int(max_tile)]
+        corner_names = self.CORNER_NAMES
 
-        corner_names = {
-            (0, 0): "左上角",
-            (0, 3): "右上角",
-            (3, 0): "左下角",
-            (3, 3): "右下角"
-        }
+        in_corner = max_count == 1 and max_pos in corner_names
+        corner_name = corner_names[max_pos] if in_corner else None
 
-        action_name = ACTION_MAP[chosen_action]
-
-        if max_pos in corner_names:
-            corner_name = corner_names[max_pos]
-            in_corner = True
-
-            # 生成位置描述
-            position_desc = gen.generate_position_description(
-                max_tile, max_pos, in_corner, corner_name
-            )
-            parts.append(position_desc)
-
-            # 检查选定的动作是否有利于保持基座
-            preserves_corner = self._action_preserves_corner(max_pos, chosen_action)
-
-            if preserves_corner:
-                # 保持基座的策略
-                strategy_desc = gen.generate_strategy_description(
-                    chosen_action, action_name, max_tile, max_pos, in_corner, corner_name, preserves_corner=True
-                )
-                parts.append(strategy_desc)
-            else:
-                # 为了合并移出基座
-                merge_opportunities = self._find_merge_opportunities(game)
-                if chosen_action in merge_opportunities:
-                    priority_desc = gen.generate_priority_merge_description(action_name, corner_name)
-                    parts.append(priority_desc)
-                else:
-                    parts.append(f"选择向{action_name}移动。")
-
-            # 分析合并机会
-            merge_opportunities = self._find_merge_opportunities(game)
-            if chosen_action in merge_opportunities:
-                merge_desc = gen.generate_merge_description(
-                    has_merge=True, action_name=action_name
-                )
-                parts.append(merge_desc)
-            else:
-                merge_desc = gen.generate_merge_description(has_merge=False)
-                parts.append(merge_desc)
-
+        if max_count > 1:
+            parts.append(gen.generate_multi_max_description(max_tile, max_count, max_positions))
         else:
-            # 不在角落
-            in_corner = False
-            parts.append(gen.generate_position_description(
-                max_tile, max_pos, in_corner
-            ))
+            parts.append(gen.generate_position_description(max_tile, max_pos, in_corner, corner_name))
+        diagnostics = self._collect_action_diagnostics(game)
 
-            # 分析向角落移动
-            nearest_corner = self._find_nearest_corner(max_pos)
-            if nearest_corner:
-                corner_name = corner_names[nearest_corner]
-                suggested = self._suggest_action_to_corner(max_pos, nearest_corner)
-                if suggested == action_name:
-                    strategy_desc = gen.generate_strategy_description(
-                        chosen_action, action_name, max_tile, max_pos, in_corner, corner_name, preserves_corner=False
-                    )
-                    parts.append(strategy_desc)
-                else:
-                    parts.append(f"选择向{action_name}移动。")
+        # 1) 先做合法性判定
+        parts.append(gen.generate_legality_header())
+        legal_actions: List[int] = []
+        for action in range(4):
+            diag = diagnostics[action]
+            if diag["legal"]:
+                legal_actions.append(action)
+            reason = gen.generate_legality_reason(
+                legal=bool(diag["legal"]),
+                score_gain=int(diag["score_gain"]),
+                line_name=str(diag["evidence_line_name"]),
+                before_line=str(diag["evidence_before_line"]),
+                after_line=str(diag["evidence_after_line"]),
+                scope="四列" if action in (0, 2) else "四行",
+            )
+            parts.append(gen.generate_legality_item(ACTION_MAP[action], bool(diag["legal"]), reason))
 
-            # 分析合并机会
-            merge_opportunities = self._find_merge_opportunities(game)
-            if chosen_action in merge_opportunities:
-                merge_desc = gen.generate_merge_description(
-                    has_merge=True, action_name=action_name
+        if legal_actions:
+            legal_actions_text = "、".join(ACTION_MAP[a] for a in legal_actions)
+            parts.append(gen.generate_legality_summary(legal_actions_text))
+        else:
+            parts.append("当前无合法动作")
+            return self._finalize_thinking(parts, chosen_action)
+
+        # 2) 对合法动作做评估比较
+        parts.append(gen.generate_eval_header())
+        for action in legal_actions:
+            diag = diagnostics[action]
+            merge_text = gen.generate_merge_effect(int(diag["score_gain"]))
+            space_text = gen.generate_space_effect(int(diag["empty_delta"]))
+
+            corner_text = gen.generate_corner_effect()
+            if diag["corner_name_before"] and diag["preserves_corner"] is True:
+                corner_text = gen.generate_corner_effect(keep_corner=str(diag["corner_name_before"]))
+            elif diag["corner_name_before"] and diag["preserves_corner"] is False:
+                corner_text = gen.generate_corner_effect(break_corner=str(diag["corner_name_before"]))
+            elif diag["corner_name_after"] and not diag["corner_name_before"]:
+                corner_text = gen.generate_corner_effect(move_to_corner=str(diag["corner_name_after"]))
+
+            mono_text = gen.generate_mono_effect(float(diag["mono_delta"]))
+            parts.append(
+                gen.generate_eval_item(
+                    action_name=ACTION_MAP[action],
+                    merge_text=merge_text,
+                    space_text=space_text,
+                    corner_text=corner_text,
+                    mono_text=mono_text,
                 )
-                parts.append(merge_desc)
+            )
 
-        # 3. 根据难度添加额外分析
-        if self.difficulty in ['intermediate', 'advanced', 'expert']:
-            # 检查单调性
-            test_game = game.clone()
-            test_game._move(chosen_action)
-            new_monotonicity = self._calculate_monotonicity(test_game.grid)
-            old_monotonicity = self._calculate_monotonicity(game.grid)
-
-            if new_monotonicity > old_monotonicity:
-                mono_desc = gen.generate_monotonicity_description()
-                parts.append(mono_desc)
+        # 3) 给出“为何不选”反例说明（至少一个）
+        alternatives = [a for a in legal_actions if a != chosen_action]
+        if alternatives:
+            alt_action = self._pick_representative_alternative(alternatives, diagnostics)
+            reject_reason = self._build_reject_reason(
+                chosen_diag=diagnostics[chosen_action],
+                alt_diag=diagnostics[alt_action],
+            )
+            parts.append(gen.generate_reject_reason(ACTION_MAP[alt_action], reject_reason))
 
         if self.difficulty in ['advanced', 'expert']:
-            # 空位情况
             empty_count = game.get_empty_cells()
             if empty_count < 4:
                 space_desc = gen.generate_space_description(empty_count)
@@ -961,6 +1157,158 @@ class ThinkingHeuristicPlayer:
                     parts.append(space_desc)
 
         return self._finalize_thinking(parts, chosen_action)
+
+    def _pick_representative_alternative(
+        self,
+        alternatives: List[int],
+        diagnostics: Dict[int, Dict[str, Any]],
+    ) -> int:
+        def _alt_value(action: int) -> float:
+            diag = diagnostics[action]
+            corner_term = 0.0
+            if diag["preserves_corner"] is True:
+                corner_term = 0.8
+            elif diag["preserves_corner"] is False:
+                corner_term = -0.8
+            return (
+                float(diag["score_gain"]) * 2.0
+                + float(diag["empty_delta"]) * 1.2
+                + float(diag["mono_delta"]) * 0.6
+                + corner_term
+            )
+
+        return max(alternatives, key=_alt_value)
+
+    def _build_reject_reason(
+        self,
+        chosen_diag: Dict[str, Any],
+        alt_diag: Dict[str, Any],
+    ) -> str:
+        if int(chosen_diag["score_gain"]) > int(alt_diag["score_gain"]):
+            return self._pick_template(self.REJECT_MERGE_REASON_TEMPLATES)
+        if chosen_diag["preserves_corner"] is True and alt_diag["preserves_corner"] is False:
+            return self._pick_template(self.REJECT_CORNER_REASON_TEMPLATES)
+        if int(chosen_diag["empty_delta"]) > int(alt_diag["empty_delta"]):
+            return self._pick_template(self.REJECT_SPACE_REASON_TEMPLATES)
+        if float(chosen_diag["mono_delta"]) > float(alt_diag["mono_delta"]):
+            return self._pick_template(self.REJECT_MONO_REASON_TEMPLATES)
+        return self._pick_template(self.REJECT_GENERAL_REASON_TEMPLATES)
+
+    def _find_max_tile_position_from_grid(self, grid: np.ndarray) -> tuple[int, int]:
+        max_tile = int(np.max(grid))
+        for i in range(4):
+            for j in range(4):
+                if int(grid[i, j]) == max_tile:
+                    return (i, j)
+        return (0, 0)
+
+    def _line_text(self, values: np.ndarray) -> str:
+        return "[" + ",".join(str(int(v)) for v in values.tolist()) + "]"
+
+    def _line_name(self, action: int, idx: int) -> str:
+        if action in (0, 2):
+            return f"第{idx + 1}列"
+        return f"第{idx + 1}行"
+
+    def _extract_line(self, grid: np.ndarray, action: int, idx: int) -> np.ndarray:
+        if action in (0, 2):
+            return grid[:, idx]
+        return grid[idx, :]
+
+    def _line_evidence(
+        self,
+        before_grid: np.ndarray,
+        after_grid: np.ndarray,
+        action: int,
+    ) -> Tuple[str, str, str, int]:
+        changed_indices: List[int] = []
+        max_change = -1
+        best_idx = 0
+
+        for idx in range(4):
+            before_line = self._extract_line(before_grid, action, idx)
+            after_line = self._extract_line(after_grid, action, idx)
+            changed = int(np.sum(before_line != after_line))
+            if changed > 0:
+                changed_indices.append(idx)
+            if changed > max_change:
+                max_change = changed
+                best_idx = idx
+
+        chosen_idx = changed_indices[0] if changed_indices else best_idx
+        before_line = self._extract_line(before_grid, action, chosen_idx)
+        after_line = self._extract_line(after_grid, action, chosen_idx)
+        return (
+            self._line_name(action, chosen_idx),
+            self._line_text(before_line),
+            self._line_text(after_line),
+            len(changed_indices),
+        )
+
+    def _collect_action_diagnostics(self, game: Game2048) -> Dict[int, Dict[str, Any]]:
+        diagnostics: Dict[int, Dict[str, Any]] = {}
+        before_grid = np.array(game.grid, copy=True)
+        empty_before = int(np.sum(before_grid == 0))
+        mono_before = float(self._calculate_monotonicity(before_grid))
+        max_before = int(np.max(before_grid))
+        max_count_before = int(np.sum(before_grid == max_before))
+        max_pos_before = self._find_max_tile_position_from_grid(before_grid)
+        corner_name_before = self.CORNER_NAMES.get(max_pos_before) if max_count_before == 1 else None
+
+        for action in range(4):
+            test_game = game.clone()
+            prev_grid = np.array(test_game.grid, copy=True)
+            prev_score = int(test_game.score)
+
+            test_game._move(action)
+            next_grid = np.array(test_game.grid, copy=True)
+            moved = not np.array_equal(prev_grid, next_grid)
+            legal = bool(moved)
+            changed_cells = int(np.sum(prev_grid != next_grid))
+
+            score_gain = int(test_game.score) - prev_score
+            empty_after = int(np.sum(next_grid == 0))
+            mono_after = float(self._calculate_monotonicity(next_grid))
+            max_after = int(np.max(next_grid))
+            max_count_after = int(np.sum(next_grid == max_after))
+            max_pos_after = self._find_max_tile_position_from_grid(next_grid)
+            corner_name_after = self.CORNER_NAMES.get(max_pos_after) if max_count_after == 1 else None
+
+            preserves_corner: Optional[bool] = None
+            if corner_name_before and legal:
+                preserves_corner = bool(corner_name_after == corner_name_before and max_after >= max_before)
+
+            evidence_line_name, evidence_before_line, evidence_after_line, changed_lines = self._line_evidence(
+                prev_grid,
+                next_grid,
+                action,
+            )
+
+            diagnostics[action] = {
+                "action": action,
+                "legal": legal,
+                "score_gain": score_gain,
+                "changed_cells": changed_cells,
+                "changed_lines": changed_lines,
+                "evidence_line_name": evidence_line_name,
+                "evidence_before_line": evidence_before_line,
+                "evidence_after_line": evidence_after_line,
+                "empty_before": empty_before,
+                "empty_after": empty_after,
+                "empty_delta": empty_after - empty_before,
+                "mono_before": mono_before,
+                "mono_after": mono_after,
+                "mono_delta": mono_after - mono_before,
+                "max_before": max_before,
+                "max_after": max_after,
+                "max_pos_before": max_pos_before,
+                "max_pos_after": max_pos_after,
+                "corner_name_before": corner_name_before,
+                "corner_name_after": corner_name_after,
+                "preserves_corner": preserves_corner,
+            }
+
+        return diagnostics
 
     def _action_preserves_corner(self, corner_pos: tuple[int, int], action: int) -> bool:
         """
@@ -1706,7 +2054,7 @@ def build_data_quality_report(games: List[Dict]) -> Dict:
     total_thinking_steps = 0
     total_thinking_chars = 0
     high_info_cot_steps = 0
-    info_keywords = ["最大数字", "空位", "可行动作", "最终选择"]
+    info_keywords = ["最大数字", "空位", "合法动作", "可行动作", "最终选择"]
 
     for game in games:
         difficulty_counter[str(game.get("difficulty", "unknown"))] += 1

@@ -36,28 +36,17 @@ _ACTION_TOKEN_TO_ID = {
     "右": 1,
     "下": 2,
     "左": 3,
-    "up": 0,
-    "right": 1,
-    "down": 2,
-    "left": 3,
-    "0": 0,
-    "1": 1,
-    "2": 2,
-    "3": 3,
 }
 
 _TRAILING_TEMPLATE_TOKEN_RE = re.compile(
     r"(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+\s*$"
 )
 _TRAILING_CHI_RE = re.compile(r"([上右下左])\s*$")
-_TRAILING_ID_RE = re.compile(r"([0-3])\s*$")
-_TRAILING_ENG_RE = re.compile(r"\b(up|right|down|left)\b\s*$", flags=re.I)
 _TRAILING_PUNCT_RE = re.compile(r"[\s,，。:：;；!！?？~…]+$")
 _THINK_CLOSE_RE = re.compile(r"</think>", flags=re.I)
 _THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.I)
 _FINAL_ACTION_CLAIM_RE = re.compile(
-    r"(?:最终|最后|选择|动作|着法|action|move)\s*(?:为|是|向|:|：)?\s*([上右下左]|[0-3]|up|right|down|left)",
-    flags=re.I,
+    r"(?:最终|最后|选择|动作|着法)\s*(?:为|是|向|:|：)?\s*([上右下左])"
 )
 _DIRECTION_PHRASE_RE = re.compile(r"(?:向|往|朝)\s*([上右下左])")
 
@@ -94,9 +83,14 @@ def _extract_non_think_output(text: str) -> str:
 def parse_action_from_non_think_text(text: str) -> Optional[int]:
     """Parse action from non-think output only.
 
+    Strict mode: `</think>` must be present, otherwise parsing fails.
     Returns None when non-think region is empty or action cannot be parsed.
     """
-    candidate = _extract_non_think_output(text)
+    normalized = _normalize_action_text(text)
+    if not _THINK_CLOSE_RE.search(normalized):
+        return None
+
+    candidate = _extract_non_think_output(normalized)
     if not candidate:
         return None
 
@@ -121,16 +115,6 @@ def parse_action_from_non_think_text(text: str) -> Optional[int]:
     trailing_match = _TRAILING_CHI_RE.search(candidate)
     if trailing_match:
         return int(ACTION_NAMES_CHI[trailing_match.group(1)])
-
-    trailing_id = _TRAILING_ID_RE.search(candidate)
-    if trailing_id:
-        return int(trailing_id.group(1))
-
-    trailing_eng = _TRAILING_ENG_RE.search(candidate)
-    if trailing_eng:
-        decoded = _decode_action_token(trailing_eng.group(1))
-        if decoded is not None:
-            return int(decoded)
 
     return None
 
@@ -408,7 +392,8 @@ def parse_action_from_text(text: str) -> int:
         text: Model output text
 
     Returns:
-        Action ID (0-3), defaults to 0 if not found
+        Action ID (0-3), defaults to 0 if not found.
+        Only Chinese direction tokens are supported.
     """
     non_think_action = parse_action_from_non_think_text(text)
     if non_think_action is not None:
@@ -423,16 +408,6 @@ def parse_action_from_text(text: str) -> int:
     trailing_match = _TRAILING_CHI_RE.search(candidate)
     if trailing_match:
         return int(ACTION_NAMES_CHI[trailing_match.group(1)])
-
-    trailing_id = _TRAILING_ID_RE.search(candidate)
-    if trailing_id:
-        return int(trailing_id.group(1))
-
-    trailing_eng = _TRAILING_ENG_RE.search(candidate)
-    if trailing_eng:
-        decoded = _decode_action_token(trailing_eng.group(1))
-        if decoded is not None:
-            return int(decoded)
 
     # Default to up (0)
     return 0

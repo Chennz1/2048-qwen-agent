@@ -31,7 +31,6 @@ class ActionWindowStats:
             return f"{self.prefix}/{name}" if self.prefix else name
 
         metrics: Dict[str, float] = {
-            _k("count"): int(self.total),
             _k("parse_rate"): float(self.parsed / denom),
             _k("legal_rate"): float(self.legal / denom),
             _k("action_acc"): float(self.correct / denom),

@@ -27,7 +27,7 @@ import torch
 
 from src.data_gen.generator import ThinkingHeuristicPlayer
 from src.data_gen.prompting import format_inference_prompt
-from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_text
+from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_non_think_text
 
 # Hugging Face mirror defaults (honor existing env if user already set it).
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -79,9 +79,10 @@ NON_THINKING_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
 }
 
-RANDOM_EVAL_INIT_TILES_MIN = 1
-RANDOM_EVAL_INIT_TILES_MAX = 4
-RANDOM_EVAL_INIT_PROB_4 = 0.5
+# Align random-eval opening settings with the environment defaults/rules.
+RANDOM_EVAL_INIT_TILES_MIN = 2
+RANDOM_EVAL_INIT_TILES_MAX = 3
+RANDOM_EVAL_INIT_PROB_4 = 0.1
 
 
 @dataclass
@@ -431,7 +432,8 @@ class LLMAgent(AgentBase):
         for out in outputs:
             response = out.outputs[0].text if out.outputs else ""
             responses.append(response)
-            actions.append(parse_action_from_text(response))
+            parsed = parse_action_from_non_think_text(response)
+            actions.append(int(parsed) if parsed is not None else -1)
         return actions, responses
 
     def _predict_batch_standard(
@@ -483,7 +485,8 @@ class LLMAgent(AgentBase):
         for seq in outputs:
             response = self.tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
             responses.append(response)
-            actions.append(parse_action_from_text(response))
+            parsed = parse_action_from_non_think_text(response)
+            actions.append(int(parsed) if parsed is not None else -1)
         return actions, responses
 
 

@@ -64,9 +64,10 @@ NON_THINKING_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
 }
 
-RANDOM_EVAL_INIT_TILES_MIN = 1
-RANDOM_EVAL_INIT_TILES_MAX = 4
-RANDOM_EVAL_INIT_PROB_4 = 0.5
+# Align random-eval opening settings with the environment defaults/rules.
+RANDOM_EVAL_INIT_TILES_MIN = 2
+RANDOM_EVAL_INIT_TILES_MAX = 3
+RANDOM_EVAL_INIT_PROB_4 = 0.1
 
 
 class Game2048Evaluator:
@@ -226,7 +227,7 @@ class Game2048Evaluator:
         llm_kwargs = {
             "model": model_ref,
             "gpu_memory_utilization": 0.9,
-            "max_model_len": 1024,
+            "max_model_len": 1280,
             "tensor_parallel_size": 1,
             "trust_remote_code": True,
         }

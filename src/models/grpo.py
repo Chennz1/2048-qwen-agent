@@ -31,7 +31,7 @@ os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 from transformers import AutoTokenizer
 
 from src.data_gen.prompting import format_inference_prompt
-from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_non_think_text
+from src.envs.game_2048 import ACTION_MAP, Game2048
 from src.utils.action_stats import ActionWindowStats
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
 
@@ -628,6 +628,7 @@ class GRPO2048Rewards:
             text = _completion_to_text(completion)
             think_text = _extract_think_text(text)
             action_id, format_quality = _parse_action_id_with_quality(text)
+            strict_format_bonus = 0.1 if action_id is not None else 0.0
             target_action_id = _coerce_action_id(
                 target_action_col[i] if target_action_col and i < len(target_action_col) else None
             )
@@ -643,7 +644,7 @@ class GRPO2048Rewards:
             state_text = state_col[i] if state_col else ""
             game = _game_from_state_text(state_text)
             if game is None:
-                rewards.append(0.0)
+                rewards.append(float(strict_format_bonus))
                 cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
@@ -651,12 +652,12 @@ class GRPO2048Rewards:
             if not valid_actions:
                 valid_actions = game.get_valid_actions()
             if not valid_actions:
-                rewards.append(0.0)
+                rewards.append(float(strict_format_bonus))
                 cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
             if action_id not in valid_actions:
-                rewards.append(float(cls._cfg.illegal_penalty))
+                rewards.append(float(cls._cfg.illegal_penalty + strict_format_bonus))
                 cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
 
@@ -666,7 +667,7 @@ class GRPO2048Rewards:
             # Use deterministic transition (move without random tile spawn) to keep reward stable.
             next_grid, moved, score_gain = cls._expert_scorer._simulate_move(prev_grid, int(action_id))
             if not moved:
-                rewards.append(float(cls._cfg.illegal_penalty))
+                rewards.append(float(cls._cfg.illegal_penalty + strict_format_bonus))
                 cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
                 continue
             score_gain = float(score_gain)
@@ -699,6 +700,7 @@ class GRPO2048Rewards:
                 + cls._cfg.w_cot_facts * cot_fact_term
                 + cls._cfg.w_cot_consistency * cot_consistency_term
                 + format_quality_term
+                + strict_format_bonus
             )
             rewards.append(float(total_reward))
             cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
@@ -916,23 +918,18 @@ def _parse_strict_action_id(text: str) -> Optional[int]:
 
 
 def _parse_action_id(text: str) -> Optional[int]:
-    """Parse action with strict-first and robust fallbacks."""
+    """Parse action with strict format only."""
     action_id, _ = _parse_action_id_with_quality(text)
     return action_id
 
 
 def _parse_action_id_with_quality(text: str) -> Tuple[Optional[int], float]:
-    """Parse action from non-think output and return (action_id, format_quality in [0,1])."""
+    """Parse action with strict format only and return (action_id, format_quality in [0,1])."""
     normalized = _normalize_completion_text(text)
 
     strict = _parse_strict_action_id(normalized)
     if strict is not None:
         return strict, 1.0
-
-    parsed = parse_action_from_non_think_text(normalized)
-    if parsed is not None:
-        # Parsed from non-think region but not strict single-token format.
-        return int(parsed), 0.8
 
     return None, 0.0
 

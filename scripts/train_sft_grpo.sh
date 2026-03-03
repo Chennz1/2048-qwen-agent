@@ -53,7 +53,7 @@ BASE_MODEL="Qwen/Qwen3-1.7B"
 NUM_GAMES=100
 RAW_DIR="data/raw_expert"
 PROCESSED_DIR="data/processed_expert"
-SFT_TRAIN_SAMPLES=4096
+SFT_TRAIN_SAMPLES=2048
 SFT_SUBSET_SEED=42
 SFT_TRAIN_DIR="data/processed_expert_sft10k/train"
 EXPERT_DEPTH=2
@@ -71,10 +71,11 @@ GRPO_BATCH_SIZE=8
 GRPO_GRAD_ACCUM=4
 GRPO_NUM_GENERATIONS=4
 GRPO_MAX_PROMPT_LENGTH=512
-GRPO_MAX_COMPLETION_LENGTH=512
+GRPO_MAX_COMPLETION_LENGTH=768
 GRPO_OUTPUT="./checkpoints/grpo"
 
 EVAL_GAMES=32
+BASELINE_EVAL_OUTPUT="data/eval/base"
 
 # 优化选项（11GB 友好默认）
 USE_UNSLOTH=false
@@ -124,6 +125,30 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# ===== 阶段-1: 训练前基座模型评测 =====
+echo "=========================================="
+echo "阶段 -1: 训练前基座模型评测"
+echo "=========================================="
+echo "评测基座模型在2048上的初始能力..."
+
+BASELINE_EVAL_BATCH_SIZE="$EVAL_GAMES"
+if [ "$BASELINE_EVAL_BATCH_SIZE" -gt 32 ]; then
+    BASELINE_EVAL_BATCH_SIZE=32
+fi
+if [ "$BASELINE_EVAL_BATCH_SIZE" -lt 1 ]; then
+    BASELINE_EVAL_BATCH_SIZE=1
+fi
+
+python -m src.eval.evaluator \
+    --is_base_model \
+    --base_model "$BASE_MODEL" \
+    --num_games "$EVAL_GAMES" \
+    --batch_size "$BASELINE_EVAL_BATCH_SIZE" \
+    --output_dir "$BASELINE_EVAL_OUTPUT" \
+    --use_thinking \
+    $( [ "$USE_VLLM" = true ] && echo "--use_vllm" ) \
+    $( [ "$USE_VLLM" = true ] && [ -n "$VLLM_QUANT" ] && echo "--vllm_quantization $VLLM_QUANT" )
 
 # ===== 阶段0: 数据准备 =====
 echo "=========================================="
@@ -289,6 +314,7 @@ echo "训练完成！"
 echo "=========================================="
 echo ""
 echo "📊 结果对比:"
+echo "  Base: data/eval/base/"
 echo "  SFT:  data/eval/sft/"
 echo "  GRPO: data/eval/grpo/"
 echo ""
