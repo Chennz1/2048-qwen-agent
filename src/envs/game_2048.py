@@ -6,6 +6,7 @@ Implementation of the 2048 game logic for training LLMs.
 import numpy as np
 import random
 import re
+import json
 from typing import Tuple, List, Optional
 
 
@@ -41,14 +42,13 @@ _ACTION_TOKEN_TO_ID = {
 _TRAILING_TEMPLATE_TOKEN_RE = re.compile(
     r"(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+\s*$"
 )
-_TRAILING_CHI_RE = re.compile(r"([上右下左])\s*$")
-_TRAILING_PUNCT_RE = re.compile(r"[\s,，。:：;；!！?？~…]+$")
-_THINK_CLOSE_RE = re.compile(r"</think>", flags=re.I)
-_THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", flags=re.I)
-_FINAL_ACTION_CLAIM_RE = re.compile(
-    r"(?:最终|最后|选择|动作|着法)\s*(?:为|是|向|:|：)?\s*([上右下左])"
+_LEADING_TEMPLATE_TOKEN_RE = re.compile(
+    r"^(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+"
 )
-_DIRECTION_PHRASE_RE = re.compile(r"(?:向|往|朝)\s*([上右下左])")
+_THINK_CLOSE_RE = re.compile(r"</think>", flags=re.I)
+_REQUIRED_TOP_LEVEL_KEYS = {"局面", "判断", "选择"}
+_REQUIRED_SITUATION_KEYS = {"最大数字", "位置", "在角落"}
+_REQUIRED_JUDGMENT_KEYS = {"上", "右", "下", "左"}
 
 
 def _normalize_action_text(text: str) -> str:
@@ -58,6 +58,11 @@ def _normalize_action_text(text: str) -> str:
         if stripped == normalized:
             break
         normalized = stripped.rstrip()
+    while True:
+        stripped = _LEADING_TEMPLATE_TOKEN_RE.sub("", normalized)
+        if stripped == normalized:
+            break
+        normalized = stripped.lstrip()
     return normalized
 
 
@@ -77,46 +82,80 @@ def _extract_non_think_output(text: str) -> str:
     if closes:
         return normalized[closes[-1].end():].strip()
 
-    return _THINK_BLOCK_RE.sub("", normalized).strip()
+    # No think block present: treat whole output as non-think region.
+    return normalized.strip()
+
+
+def _is_plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_valid_position_list(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    for coord in value:
+        if not isinstance(coord, list) or len(coord) != 2:
+            return False
+        if not all(_is_plain_int(v) for v in coord):
+            return False
+        if not (0 <= coord[0] <= 3 and 0 <= coord[1] <= 3):
+            return False
+    return True
+
+
+def _validate_action_json_schema(obj: object) -> Optional[int]:
+    if not isinstance(obj, dict):
+        return None
+    if set(obj.keys()) != _REQUIRED_TOP_LEVEL_KEYS:
+        return None
+
+    situation = obj.get("局面")
+    judgment = obj.get("判断")
+    choice = obj.get("选择")
+
+    if not isinstance(situation, dict) or set(situation.keys()) != _REQUIRED_SITUATION_KEYS:
+        return None
+    if not _is_plain_int(situation.get("最大数字")):
+        return None
+    if not _is_valid_position_list(situation.get("位置")):
+        return None
+    if not isinstance(situation.get("在角落"), bool):
+        return None
+
+    if not isinstance(judgment, dict) or set(judgment.keys()) != _REQUIRED_JUDGMENT_KEYS:
+        return None
+    if not all(isinstance(v, bool) for v in judgment.values()):
+        return None
+
+    if not isinstance(choice, str):
+        return None
+    choice_norm = choice.strip()
+    action_id = _decode_action_token(choice_norm)
+    if action_id is None:
+        return None
+    if judgment.get(choice_norm) is not True:
+        return None
+    return int(action_id)
 
 
 def parse_action_from_non_think_text(text: str) -> Optional[int]:
-    """Parse action from non-think output only.
+    """Parse action from non-think output JSON only.
 
-    Strict mode: `</think>` must be present, otherwise parsing fails.
-    Returns None when non-think region is empty or action cannot be parsed.
+    Strict mode:
+    - Only parse non-think region (text after the last `</think>` when present).
+    - Non-think region must be valid JSON and pass action schema checks.
+    - Returns None when JSON is invalid or schema/choice is invalid.
     """
-    normalized = _normalize_action_text(text)
-    if not _THINK_CLOSE_RE.search(normalized):
-        return None
-
-    candidate = _extract_non_think_output(normalized)
+    candidate = _extract_non_think_output(text)
     if not candidate:
         return None
 
-    candidate = _TRAILING_PUNCT_RE.sub("", candidate.strip())
-    if not candidate:
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
         return None
 
-    direct = _decode_action_token(candidate)
-    if direct is not None:
-        return int(direct)
-
-    final_claims = _FINAL_ACTION_CLAIM_RE.findall(candidate)
-    if final_claims:
-        claimed = _decode_action_token(final_claims[-1])
-        if claimed is not None:
-            return int(claimed)
-
-    direction_phrases = _DIRECTION_PHRASE_RE.findall(candidate)
-    if direction_phrases:
-        return int(ACTION_NAMES_CHI[direction_phrases[-1]])
-
-    trailing_match = _TRAILING_CHI_RE.search(candidate)
-    if trailing_match:
-        return int(ACTION_NAMES_CHI[trailing_match.group(1)])
-
-    return None
+    return _validate_action_json_schema(parsed)
 
 
 class Game2048:
@@ -392,25 +431,13 @@ def parse_action_from_text(text: str) -> int:
         text: Model output text
 
     Returns:
-        Action ID (0-3), defaults to 0 if not found.
-        Only Chinese direction tokens are supported.
+        Action ID (0-3), or -1 when output is invalid/illegal.
     """
     non_think_action = parse_action_from_non_think_text(text)
     if non_think_action is not None:
         return int(non_think_action)
 
-    candidate = _normalize_action_text(text)
-
-    direct = _decode_action_token(candidate)
-    if direct is not None:
-        return int(direct)
-
-    trailing_match = _TRAILING_CHI_RE.search(candidate)
-    if trailing_match:
-        return int(ACTION_NAMES_CHI[trailing_match.group(1)])
-
-    # Default to up (0)
-    return 0
+    return -1
 
 
 if __name__ == "__main__":

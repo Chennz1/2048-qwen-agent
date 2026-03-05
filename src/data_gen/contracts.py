@@ -10,8 +10,11 @@ This module is the single source of truth for dataset schemas used by:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Dict, List, Optional, Tuple
+
+from src.envs.game_2048 import parse_action_from_non_think_text
 
 SCHEMA_VERSION = "1.0"
 VALID_ACTIONS = ["上", "右", "下", "左"]
@@ -119,6 +122,24 @@ def validate_raw_game(game: Dict) -> ValidationResult:
         if "thinking" in state and not isinstance(state["thinking"], str):
             return ValidationResult(False, f"State {idx}: thinking must be string if provided")
 
+        if "action_json" in state:
+            action_json_value = state["action_json"]
+            if isinstance(action_json_value, str):
+                action_json_text = action_json_value
+            elif isinstance(action_json_value, dict):
+                action_json_text = json.dumps(action_json_value, ensure_ascii=False)
+            else:
+                return ValidationResult(False, f"State {idx}: action_json must be dict or string")
+
+            parsed_action = parse_action_from_non_think_text(action_json_text)
+            if parsed_action is None:
+                return ValidationResult(False, f"State {idx}: action_json is not valid action JSON")
+            if int(parsed_action) != int(action_id):
+                return ValidationResult(
+                    False,
+                    f"State {idx}: action_json/action_id mismatch ({parsed_action}, {action_id})",
+                )
+
     return ValidationResult(True)
 
 
@@ -158,8 +179,12 @@ def validate_processed_sample(sample: Dict, require_thinking: bool = False) -> V
             break
         normalized = stripped.rstrip()
 
-    if not any(normalized.endswith(action) for action in VALID_ACTIONS):
-        return ValidationResult(False, "assistant response must end with one legal action token")
+    parsed_action = parse_action_from_non_think_text(normalized)
+    if parsed_action is None:
+        return ValidationResult(
+            False,
+            "assistant response non-think region must be a valid action JSON object",
+        )
 
     has_think_tag = "<think>" in target_text and "</think>" in target_text
     if require_thinking and not has_think_tag:

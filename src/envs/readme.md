@@ -13,7 +13,7 @@
 ### `src/envs/game_2048.py`
 - 常量：
   - `ACTION_MAP`：`0=上, 1=右, 2=下, 3=左`
-  - `ACTION_NAMES_ENG` / `ACTION_NAMES_CHI`：文本解析映射
+  - `ACTION_NAMES_ENG` / `ACTION_NAMES_CHI`：方向映射
 - 核心类：`Game2048`
 - 工具函数：`parse_action_from_text(text)`
 
@@ -56,9 +56,10 @@
 - 该格式被 `data`/`models`/`eval` 模块直接复用。
 
 ## 文本动作解析
-- `parse_action_from_text(text)` 仅支持中文方向关键词（上/右/下/左）。
-- 解析优先级：中文关键词 -> 默认 `上(0)`。
-- 建议：评估时保留合法动作率统计，及时发现解析退化。
+- `parse_action_from_non_think_text(text)`：只解析非 `<think>` 区域中的 JSON。
+- `parse_action_from_text(text)`：严格复用上述 JSON 解析；解析失败返回 `-1`（非法动作）。
+- 非 `<think>` 区 JSON 必须包含 `局面/判断/选择` 三个顶层键，且 `选择` 必须是合法方向并在 `判断` 中为 `true`。
+- JSON 非法、schema 不匹配、或选择非法方向时，统一按非法动作处理。
 
 ## 常见问题与建议
 
@@ -67,5 +68,5 @@
 - 当前实现使用全局随机种子，若多实例并发可能相互影响。
 
 ### 2) 动作解析偏向某方向
-- 确保模型最终输出是单个中文方向字（上/右/下/左）。
-- 可在上层 prompt 里强化“最终只输出一个中文方向字”。
+- 确保模型在非 `<think>` 区只输出合法 JSON 对象。
+- 可在上层 prompt 里强化 JSON schema 与“禁止额外文本”约束。

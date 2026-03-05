@@ -26,7 +26,7 @@
 - 作用：统一训练与推理的 prompt 构造方式，避免模板漂移。
 - 关键函数：
   - `build_user_prompt(state_text, use_thinking)`
-  - `build_assistant_content(action, use_thinking, thinking=None)`
+  - `build_assistant_content(action, state_text, use_thinking, thinking=None)`
   - `build_messages(...)`
   - `format_sample_text(tokenizer, messages, apply_chat_template)`
   - `format_inference_prompt(tokenizer, state_text, use_thinking=True)`
@@ -60,7 +60,7 @@
 - 路径：`data/raw/*.json`
 - 关键字段：
   - 顶层：`schema_version`, `game_id`, `difficulty`, `states`, `final_score`, `max_tile`, `total_steps`
-  - `states[i]`：`state`, `action`, `action_id`, `score`, `step`, `thinking?`
+  - `states[i]`：`state`, `action`, `action_id`, `action_json`, `score`, `step`, `thinking?`
 
 ### 输出：processed 训练集
 - 路径：`data/processed/{train,val,test}`
@@ -69,18 +69,18 @@
   - 可选元数据：`schema_version`, `source_game_id`, `source_step`
 - 约束：
   - `text` 必须非空
-  - 结尾必须是合法动作之一：`上/右/下/左`
+  - 非 `<think>` 区域必须是合法 JSON 对象，且可被严格动作解析器解析
   - CoT 模式要求包含 `<think>...</think>`
 
 ## 典型调用链
 
 1. `generator.py` 生成 raw  
-2. `processor.py` 执行格式转换与校验  
+2. `processor.py` 优先使用 raw 里的 `action_json` 构建 completion，并执行格式校验  
 3. `models/*` 直接读取 `data/processed/train|val`
 
 ## 常见问题与排查
 
-### 1) 训练输出不是动作字符
+### 1) 训练输出不是合法 JSON
 - 检查是否训练和推理都使用同一套模板（`prompting.py`）。
 - 检查 `format_sample_text(..., apply_chat_template=True)` 是否与推理保持一致。
 

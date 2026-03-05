@@ -15,6 +15,7 @@ import numpy as np
 
 from src.envs.game_2048 import Game2048, ACTION_MAP
 from src.data_gen.contracts import SCHEMA_VERSION
+from src.data_gen.prompting import build_action_json_text
 
 
 # Strategy definitions
@@ -1816,6 +1817,7 @@ def generate_games(
         scores = []
         steps = []
         thinkings = [] if with_thinking else None
+        action_jsons: List[str] = []
 
         for step in range(max_steps):
             state = game._get_state()
@@ -1830,6 +1832,7 @@ def generate_games(
 
             states.append(state)
             actions.append(action)
+            action_jsons.append(build_action_json_text(state_text=state, action=ACTION_MAP[action]))
             scores.append(game.score)
             steps.append(step)
 
@@ -1855,6 +1858,7 @@ def generate_games(
                 'state': states[i],
                 'action': ACTION_MAP[actions[i]],
                 'action_id': actions[i],
+                'action_json': json.loads(action_jsons[i]),
                 'score': scores[i],
                 'step': steps[i]
             }

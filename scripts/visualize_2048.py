@@ -94,6 +94,11 @@ NON_THINKING_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
 }
 
+THINKING_PROMPT_MAX_LENGTH = 600
+THINKING_MAX_NEW_TOKENS = 768
+NON_THINKING_PROMPT_MAX_LENGTH = 600
+NON_THINKING_MAX_NEW_TOKENS = 768
+
 
 class Game2048Visualizer:
     """2048游戏可视化器"""
@@ -391,7 +396,7 @@ class Game2048Visualizer:
             top_p=sampling["top_p"],
             top_k=sampling["top_k"],
             min_p=sampling["min_p"],
-            max_tokens=768 if self.use_thinking else 64,
+            max_tokens=THINKING_MAX_NEW_TOKENS if self.use_thinking else NON_THINKING_MAX_NEW_TOKENS,
             presence_penalty=self.presence_penalty,
         )
 
@@ -411,7 +416,7 @@ class Game2048Visualizer:
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=512
+            max_length=THINKING_PROMPT_MAX_LENGTH if self.use_thinking else NON_THINKING_PROMPT_MAX_LENGTH
         )
 
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
@@ -419,7 +424,7 @@ class Game2048Visualizer:
         with torch.no_grad():
             generate_kwargs = {
                 **inputs,
-                "max_new_tokens": 768 if self.use_thinking else 64,
+                "max_new_tokens": THINKING_MAX_NEW_TOKENS if self.use_thinking else NON_THINKING_MAX_NEW_TOKENS,
                 "temperature": sampling["temperature"],
                 "top_p": sampling["top_p"],
                 "top_k": sampling["top_k"],

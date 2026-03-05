@@ -40,9 +40,9 @@
   - `GRPO2048Rewards`：奖励函数集合
   - `TRLGRPO2048Trainer`：封装 TRL `GRPOTrainer`
 - 奖励函数：
-  - `expert_shaped`（默认）：合法性 + 分数归一化 + 局面势能 + expectimax 专家对齐 + 风险约束
-  - `simple`（对照）：`action_validity + one_step_gain`
-  - 奖励配置：`ExpertRewardConfig`，可通过 CLI 权重与搜索深度参数调整
+  - `json_focused`（默认）：固定分值评估 JSON 结构、局面事实、合法性判断与动作合法性，并对 expert 最优动作命中额外加分
+  - 非 `<think>` 区 JSON 非法时直接给大额负分
+  - 奖励配置：`JsonRewardConfig`（无权重映射项）
 
 ### `src/models/lora_config.py`
 - 作用：集中管理 LoRA 参数，减少重复配置。

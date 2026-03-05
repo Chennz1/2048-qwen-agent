@@ -31,7 +31,7 @@ os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 from transformers import AutoTokenizer
 
 from src.data_gen.prompting import format_inference_prompt
-from src.envs.game_2048 import ACTION_MAP, Game2048
+from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_non_think_text
 from src.utils.action_stats import ActionWindowStats
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
 
@@ -42,21 +42,8 @@ _TRAILING_TEMPLATE_TOKEN_RE = re.compile(
 _LEADING_TEMPLATE_TOKEN_RE = re.compile(
     r"^(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+"
 )
-_STRICT_ACTION_OUTPUT_RE = re.compile(
-    r"^\s*(?:<think>[\s\S]*?</think>\s*)?([上右下左])\s*$"
-)
-_ACTION_CHAR_HINT_RE = re.compile(r"(?:动作|action)\s*[:：]?\s*([上右下左])", flags=re.I)
-_ACTION_ID_HINT_RE = re.compile(r"(?:动作|action)\s*[:：]?\s*([0-3])", flags=re.I)
-_TRAILING_ACTION_CHAR_RE = re.compile(r"([上右下左])\s*$")
-_TRAILING_ACTION_ID_RE = re.compile(r"([0-3])\s*$")
-_ACTION_WORD_RE = re.compile(r"\b(up|right|down|left)\b", flags=re.I)
-_MAX_TILE_CLAIM_RE = re.compile(r"(?:最大(?:数字|块|值)?|max(?:\s*tile)?)\s*[:：]?\s*(\d+)", flags=re.I)
-_EMPTY_CLAIM_RE = re.compile(r"(?:空位|空格|空白|empty(?:\s*cells?)?)\s*[:：]?\s*(\d+)", flags=re.I)
-_VALID_ACTIONS_SEGMENT_RE = re.compile(r"(?:可行动作|合法动作|可选动作)[^。\n]*", flags=re.I)
-_FINAL_ACTION_CLAIM_RE = re.compile(
-    r"(?:最终|最后|选择|动作|着法|action|move)\s*(?:为|是|向|:|：)?\s*([上右下左]|[0-3]|up|right|down|left)",
-    flags=re.I,
-)
+_THINK_BLOCK_RE = re.compile(r"<think>\s*([\s\S]*?)\s*</think>", flags=re.I)
+_THINK_CLOSE_RE = re.compile(r"</think>", flags=re.I)
 _ACTION_CHAR_TO_ID = {v: k for k, v in ACTION_MAP.items()}
 _ACTION_WORD_TO_ID = {
     "up": 0,
@@ -64,6 +51,9 @@ _ACTION_WORD_TO_ID = {
     "down": 2,
     "left": 3,
 }
+_TOP_LEVEL_KEYS = {"局面", "判断", "选择"}
+_SITUATION_KEYS = {"最大数字", "位置", "在角落"}
+_JUDGMENT_KEYS = {"上", "右", "下", "左"}
 
 
 def _load_trl_grpo_symbols():
@@ -167,6 +157,9 @@ def _build_grpo_config(
 ):
     """Build GRPOConfig with runtime compatibility across TRL versions."""
     params = set(inspect.signature(GRPOConfig.__init__).parameters.keys())
+    # Prevent vLLM from allocating KV cache for the model's full native context
+    # (e.g. 40k), which can OOM in colocate mode.
+    vllm_max_model_len = int(max_prompt_length + max_completion_length + 64)
 
     kwargs: Dict[str, Any] = {
         "output_dir": output_dir,
@@ -185,7 +178,8 @@ def _build_grpo_config(
         "report_to": report_to,
         "use_vllm": True,
         "vllm_mode": "colocate",
-        "vllm_gpu_memory_utilization" : 0.3,
+        "vllm_gpu_memory_utilization": 0.25,
+        "max_model_len": vllm_max_model_len,
     }
 
     # Length args vary across TRL versions. Provide fallbacks when canonical
@@ -262,21 +256,44 @@ class GRPO2048DataConfig:
 
 
 @dataclass
-class ExpertRewardConfig:
-    """Config for expert-shaped GRPO reward."""
+class JsonRewardConfig:
+    """Config for fixed-score JSON-focused GRPO reward."""
 
-    format_penalty: float = -1.2
-    illegal_penalty: float = -0.6
-    legal_bonus: float = 0.45
-    format_quality_weight: float = 0.05
-    potential_norm: float = 5.0
-    w_score: float = 0.20
-    w_potential: float = 0.25
-    w_expert: float = 0.35
-    w_cot_facts: float = 0.10
-    w_cot_consistency: float = 0.08
+    json_invalid_penalty: float = -20.0
+
+    top_level_ok_bonus: float = 1.0
+    top_level_bad_penalty: float = -1.0
+    situation_schema_ok_bonus: float = 1.0
+    situation_schema_bad_penalty: float = -1.0
+    judgment_schema_ok_bonus: float = 1.0
+    judgment_schema_bad_penalty: float = -1.0
+    choice_schema_ok_bonus: float = 1.0
+    choice_schema_bad_penalty: float = -2.0
+
+    max_tile_correct_bonus: float = 1.0
+    max_tile_wrong_penalty: float = -1.0
+    positions_correct_bonus: float = 2.0
+    positions_wrong_penalty: float = -2.0
+    corner_correct_bonus: float = 1.0
+    corner_wrong_penalty: float = -1.0
+
+    judgment_match_bonus: float = 1.0
+    judgment_mismatch_penalty: float = -0.5
+
+    choice_legal_bonus: float = 1.0
+    choice_illegal_penalty: float = -0.5
+
+    expert_match_bonus: float = 3.0
+    all_correct_bonus: float = 2.0
+    cot_length_threshold: int = 100
+    cot_length_bonus: float = 0.5
+
     expert_depth: int = 2
     expert_max_empty: int = 8
+
+
+# Backward-compatible alias for older imports.
+ExpertRewardConfig = JsonRewardConfig
 
 
 class GRPO2048DatasetBuilder:
@@ -589,7 +606,7 @@ class ExpectimaxActionScorer:
 class GRPO2048Rewards:
     """Reward functions compatible with TRL GRPOTrainer callbacks."""
 
-    _cfg: ExpertRewardConfig = ExpertRewardConfig()
+    _cfg: JsonRewardConfig = JsonRewardConfig()
     _window_stats: Optional[ActionWindowStats] = None
     _potential_model: BoardPotentialModel = BoardPotentialModel()
     _expert_scorer: ExpectimaxActionScorer = ExpectimaxActionScorer(
@@ -599,7 +616,7 @@ class GRPO2048Rewards:
     )
 
     @classmethod
-    def configure(cls, cfg: ExpertRewardConfig) -> None:
+    def configure(cls, cfg: JsonRewardConfig) -> None:
         cls._cfg = cfg
         cls._expert_scorer = ExpectimaxActionScorer(
             potential_model=cls._potential_model,
@@ -612,13 +629,88 @@ class GRPO2048Rewards:
         cls._window_stats = stats
 
     @classmethod
-    def _record_window_stats(cls, *, parsed: bool, legal: bool, correct: bool) -> None:
+    def _record_window_stats(
+        cls,
+        *,
+        parsed: bool,
+        legal: bool,
+        correct: bool,
+        reward_format: Optional[float] = None,
+        reward_legal: Optional[float] = None,
+        reward_facts: Optional[float] = None,
+        reward_expert: Optional[float] = None,
+        reward_all_correct: Optional[float] = None,
+    ) -> None:
         if cls._window_stats is None:
             return
-        cls._window_stats.update(parsed=parsed, legal=legal, correct=correct)
+        cls._window_stats.update(
+            parsed=parsed,
+            legal=legal,
+            correct=correct,
+            reward_format=reward_format,
+            reward_legal=reward_legal,
+            reward_facts=reward_facts,
+            reward_expert=reward_expert,
+            reward_all_correct=reward_all_correct,
+        )
+
+    @staticmethod
+    def _is_plain_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
 
     @classmethod
-    def expert_shaped(cls, completions: List[Any], **kwargs) -> List[float]:
+    def _extract_non_think_region(cls, text: str) -> str:
+        normalized = _normalize_completion_text(text)
+        closes = list(_THINK_CLOSE_RE.finditer(normalized))
+        if closes:
+            return normalized[closes[-1].end():].strip()
+        return normalized.strip()
+
+    @classmethod
+    def _parse_non_think_json_object(cls, text: str) -> Optional[Dict[str, Any]]:
+        candidate = cls._extract_non_think_region(text)
+        if not candidate:
+            return None
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @classmethod
+    def _extract_think_region(cls, text: str) -> str:
+        normalized = _normalize_completion_text(text)
+        match = _THINK_BLOCK_RE.search(normalized)
+        if match is None:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    @classmethod
+    def _coerce_position_set(cls, value: Any) -> Optional[set[tuple[int, int]]]:
+        if not isinstance(value, list):
+            return None
+        result: set[tuple[int, int]] = set()
+        for coord in value:
+            if not isinstance(coord, list) or len(coord) != 2:
+                return None
+            r, c = coord[0], coord[1]
+            if not (cls._is_plain_int(r) and cls._is_plain_int(c)):
+                return None
+            if not (0 <= int(r) <= 3 and 0 <= int(c) <= 3):
+                return None
+            result.add((int(r), int(c)))
+        return result
+
+    @classmethod
+    def _expert_best_actions(cls, grid: np.ndarray, valid_actions: List[int]) -> set[int]:
+        values = cls._expert_scorer.action_values(grid, valid_actions)
+        if not values:
+            return set()
+        best = float(max(values.values()))
+        return {int(a) for a, v in values.items() if abs(float(v) - best) <= 1e-6}
+
+    @classmethod
+    def json_focused(cls, completions: List[Any], **kwargs) -> List[float]:
         state_col = kwargs.get("state_text")
         valid_actions_col = kwargs.get("valid_actions")
         target_action_col = kwargs.get("target_action")
@@ -626,169 +718,202 @@ class GRPO2048Rewards:
 
         for i, completion in enumerate(completions):
             text = _completion_to_text(completion)
-            think_text = _extract_think_text(text)
-            action_id, format_quality = _parse_action_id_with_quality(text)
-            strict_format_bonus = 0.1 if action_id is not None else 0.0
-            target_action_id = _coerce_action_id(
-                target_action_col[i] if target_action_col and i < len(target_action_col) else None
-            )
-            parsed = action_id is not None
+            think_text = cls._extract_think_region(text)
+            predicted = cls._parse_non_think_json_object(text)
+            parsed = predicted is not None
             legal = False
-            correct = bool(parsed and target_action_id is not None and action_id == target_action_id)
+            correct = False
+            format_score = 0.0
+            legal_score = 0.0
+            facts_score = 0.0
+            expert_score = 0.0
+            all_correct_score = 0.0
+            cot_length_score = 0.0
+            format_full = False
+            legal_full = False
+            facts_full = False
+            if len(think_text) > int(cls._cfg.cot_length_threshold):
+                cot_length_score += float(cls._cfg.cot_length_bonus)
 
-            if action_id is None:
-                rewards.append(float(cls._cfg.format_penalty))
-                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
+            if predicted is None:
+                format_score = float(cls._cfg.json_invalid_penalty)
+                total_score = float(format_score + cot_length_score)
+                rewards.append(total_score)
+                cls._record_window_stats(
+                    parsed=parsed,
+                    legal=legal,
+                    correct=correct,
+                    reward_format=format_score,
+                    reward_legal=legal_score,
+                    reward_facts=facts_score,
+                    reward_expert=expert_score,
+                    reward_all_correct=all_correct_score,
+                )
                 continue
 
             state_text = state_col[i] if state_col else ""
             game = _game_from_state_text(state_text)
             if game is None:
-                rewards.append(float(strict_format_bonus))
-                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
+                format_score = float(cls._cfg.json_invalid_penalty)
+                total_score = float(format_score + cot_length_score)
+                rewards.append(total_score)
+                cls._record_window_stats(
+                    parsed=parsed,
+                    legal=legal,
+                    correct=correct,
+                    reward_format=format_score,
+                    reward_legal=legal_score,
+                    reward_facts=facts_score,
+                    reward_expert=expert_score,
+                    reward_all_correct=all_correct_score,
+                )
                 continue
 
             valid_actions = _coerce_valid_actions(valid_actions_col[i] if valid_actions_col else None)
             if not valid_actions:
                 valid_actions = game.get_valid_actions()
-            if not valid_actions:
-                rewards.append(float(strict_format_bonus))
-                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
-                continue
-
-            if action_id not in valid_actions:
-                rewards.append(float(cls._cfg.illegal_penalty + strict_format_bonus))
-                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
-                continue
-
             prev_grid = np.array(game.grid, copy=True)
-            prev_potential = cls._potential_model.score(prev_grid, valid_actions)
+            valid_set = set(int(a) for a in valid_actions)
+            true_max_tile = int(np.max(prev_grid))
+            true_positions = {
+                (int(r), int(c))
+                for r, c in zip(*np.where(prev_grid == true_max_tile))
+            }
+            true_corner = any((r, c) in {(0, 0), (0, 3), (3, 0), (3, 3)} for r, c in true_positions)
+            true_judgment = {ACTION_MAP[a]: (a in valid_set) for a in range(4)}
+            top_level_ok = set(predicted.keys()) == _TOP_LEVEL_KEYS
+            format_score += (
+                float(cls._cfg.top_level_ok_bonus)
+                if top_level_ok
+                else float(cls._cfg.top_level_bad_penalty)
+            )
 
-            # Use deterministic transition (move without random tile spawn) to keep reward stable.
-            next_grid, moved, score_gain = cls._expert_scorer._simulate_move(prev_grid, int(action_id))
-            if not moved:
-                rewards.append(float(cls._cfg.illegal_penalty + strict_format_bonus))
-                cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
-                continue
-            score_gain = float(score_gain)
-            legal = True
-            next_valid_actions = cls._expert_scorer._valid_actions(next_grid)
-            next_potential = cls._potential_model.score(next_grid, next_valid_actions)
+            situation = predicted.get("局面")
+            pred_pos_set: Optional[set[tuple[int, int]]] = None
+            if isinstance(situation, dict):
+                pred_pos_set = cls._coerce_position_set(situation.get("位置"))
+            situation_schema_ok = (
+                isinstance(situation, dict)
+                and set(situation.keys()) == _SITUATION_KEYS
+                and cls._is_plain_int(situation.get("最大数字"))
+                and pred_pos_set is not None
+                and isinstance(situation.get("在角落"), bool)
+            )
+            format_score += (
+                float(cls._cfg.situation_schema_ok_bonus)
+                if situation_schema_ok
+                else float(cls._cfg.situation_schema_bad_penalty)
+            )
 
-            if score_gain > 0:
-                score_term = float(1.0 + 0.02 * np.log(score_gain))
+            judgment = predicted.get("判断")
+            judgment_schema_ok = (
+                isinstance(judgment, dict)
+                and set(judgment.keys()) == _JUDGMENT_KEYS
+                and all(isinstance(v, bool) for v in judgment.values())
+            )
+            format_score += (
+                float(cls._cfg.judgment_schema_ok_bonus)
+                if judgment_schema_ok
+                else float(cls._cfg.judgment_schema_bad_penalty)
+            )
+
+            choice_raw = predicted.get("选择")
+            choice_name = choice_raw.strip() if isinstance(choice_raw, str) else None
+            choice_id = _ACTION_CHAR_TO_ID.get(choice_name or "")
+            choice_schema_ok = choice_id is not None
+            format_score += (
+                float(cls._cfg.choice_schema_ok_bonus)
+                if choice_schema_ok
+                else float(cls._cfg.choice_schema_bad_penalty)
+            )
+            format_full = bool(
+                top_level_ok and situation_schema_ok and judgment_schema_ok and choice_schema_ok
+            )
+
+            pred_max_tile = situation.get("最大数字") if isinstance(situation, dict) else None
+            if cls._is_plain_int(pred_max_tile) and int(pred_max_tile) == true_max_tile:
+                facts_score += float(cls._cfg.max_tile_correct_bonus)
+                max_tile_ok = True
             else:
-                score_term = 0.0
-            potential_term = float(
-                np.tanh((next_potential - prev_potential) / max(cls._cfg.potential_norm, 1e-6))
-            )
-            expert_term = cls._expert_term(prev_grid, valid_actions, action_id)
-            cot_fact_term = cls._cot_fact_term(think_text, prev_grid, valid_actions)
-            cot_consistency_term = cls._cot_consistency_term(
-                think_text=think_text,
-                action_id=action_id,
-                prev_grid=prev_grid,
-                next_grid=next_grid,
-            )
-            format_quality_term = cls._cfg.format_quality_weight * float(np.clip(format_quality, 0.0, 1.0))
+                facts_score += float(cls._cfg.max_tile_wrong_penalty)
+                max_tile_ok = False
 
-            total_reward = (
-                cls._cfg.legal_bonus
-                + cls._cfg.w_score * score_term
-                + cls._cfg.w_potential * potential_term
-                + cls._cfg.w_expert * expert_term
-                + cls._cfg.w_cot_facts * cot_fact_term
-                + cls._cfg.w_cot_consistency * cot_consistency_term
-                + format_quality_term
-                + strict_format_bonus
+            if pred_pos_set is not None and pred_pos_set == true_positions:
+                facts_score += float(cls._cfg.positions_correct_bonus)
+                positions_ok = True
+            else:
+                facts_score += float(cls._cfg.positions_wrong_penalty)
+                positions_ok = False
+
+            pred_corner = situation.get("在角落") if isinstance(situation, dict) else None
+            if isinstance(pred_corner, bool) and bool(pred_corner) == bool(true_corner):
+                facts_score += float(cls._cfg.corner_correct_bonus)
+                corner_ok = True
+            else:
+                facts_score += float(cls._cfg.corner_wrong_penalty)
+                corner_ok = False
+            facts_full = bool(max_tile_ok and positions_ok and corner_ok)
+
+            all_judgment_ok = True
+            for action_id in range(4):
+                action_name = ACTION_MAP[action_id]
+                expected = true_judgment[action_name]
+                pred_val = judgment.get(action_name) if isinstance(judgment, dict) else None
+                if isinstance(pred_val, bool) and pred_val == expected:
+                    legal_score += float(cls._cfg.judgment_match_bonus)
+                else:
+                    legal_score += float(cls._cfg.judgment_mismatch_penalty)
+                    all_judgment_ok = False
+
+            if choice_id is not None and int(choice_id) in valid_set:
+                legal = True
+                legal_score += float(cls._cfg.choice_legal_bonus)
+            else:
+                legal_score += float(cls._cfg.choice_illegal_penalty)
+            legal_full = bool(all_judgment_ok and legal)
+
+            if choice_id is not None:
+                expert_best = cls._expert_best_actions(prev_grid, valid_actions)
+                if int(choice_id) in expert_best:
+                    expert_score += float(cls._cfg.expert_match_bonus)
+
+            target_action_id = _coerce_action_id(
+                target_action_col[i] if target_action_col and i < len(target_action_col) else None
             )
-            rewards.append(float(total_reward))
-            cls._record_window_stats(parsed=parsed, legal=legal, correct=correct)
+            correct = bool(choice_id is not None and target_action_id is not None and int(choice_id) == target_action_id)
+            if bool(format_full and legal_full and facts_full and correct):
+                all_correct_score += float(cls._cfg.all_correct_bonus)
+
+            total_score = float(
+                format_score
+                + legal_score
+                + facts_score
+                + expert_score
+                + all_correct_score
+                + cot_length_score
+            )
+            rewards.append(total_score)
+            cls._record_window_stats(
+                parsed=parsed,
+                legal=legal,
+                correct=correct,
+                reward_format=format_score,
+                reward_legal=legal_score,
+                reward_facts=facts_score,
+                reward_expert=expert_score,
+                reward_all_correct=all_correct_score,
+            )
 
         return rewards
 
     @classmethod
+    def expert_shaped(cls, completions: List[Any], **kwargs) -> List[float]:
+        """Backward-compatible alias; now uses fixed-score JSON-focused reward."""
+        return cls.json_focused(completions, **kwargs)
+
+    @classmethod
     def get_reward_funcs(cls) -> List[Any]:
-        return [cls.expert_shaped]
-
-    @classmethod
-    def _expert_term(cls, grid: np.ndarray, valid_actions: List[int], action_id: int) -> float:
-        values = cls._expert_scorer.action_values(grid, valid_actions)
-        if action_id not in values or not values:
-            return 0.0
-
-        arr = np.array([values[a] for a in valid_actions if a in values], dtype=float)
-        if arr.size == 0:
-            return 0.0
-
-        best = float(arr.max())
-        worst = float(arr.min())
-        span = best - worst
-        if span < 1e-6:
-            return 0.5
-
-        val = float(values[action_id])
-        percentile = (val - worst) / span  # [0, 1]
-
-        std = float(arr.std())
-        if std < 1e-6:
-            confidence = percentile
-        else:
-            z = (val - float(arr.mean())) / std
-            confidence = 0.5 * (float(np.tanh(z)) + 1.0)  # [0, 1]
-
-        aligned = 0.7 * percentile + 0.3 * confidence
-        return float(np.clip(aligned, 0.0, 1.0))
-
-    @classmethod
-    def _cot_fact_term(cls, think_text: str, grid: np.ndarray, valid_actions: List[int]) -> float:
-        if not think_text:
-            return 0.0
-
-        scores: List[float] = []
-        true_max_tile = int(np.max(grid))
-        true_empty = int(np.sum(grid == 0))
-        true_valid_set = set(int(a) for a in valid_actions)
-
-        for m in _MAX_TILE_CLAIM_RE.finditer(think_text):
-            claim = int(m.group(1))
-            scores.append(1.0 if claim == true_max_tile else -1.0)
-
-        for m in _EMPTY_CLAIM_RE.finditer(think_text):
-            claim = int(m.group(1))
-            scores.append(1.0 if claim == true_empty else -1.0)
-
-        claimed_actions = _extract_claimed_action_set(think_text)
-        if claimed_actions is not None:
-            scores.append(1.0 if set(claimed_actions) == true_valid_set else -1.0)
-
-        if not scores:
-            return 0.0
-        return float(np.clip(float(np.mean(scores)), -1.0, 1.0))
-
-    @classmethod
-    def _cot_consistency_term(
-        cls,
-        think_text: str,
-        action_id: int,
-        prev_grid: np.ndarray,
-        next_grid: np.ndarray,
-    ) -> float:
-        if not think_text:
-            return 0.0
-
-        scores: List[float] = []
-        claimed_final = _extract_claimed_final_action(think_text)
-        if claimed_final is not None:
-            scores.append(1.0 if int(claimed_final) == int(action_id) else -1.0)
-
-        if _mentions_corner_preserve(think_text) and cls._potential_model.max_tile_in_corner(prev_grid):
-            next_corner_locked = cls._potential_model.max_tile_in_corner(next_grid)
-            scores.append(1.0 if next_corner_locked else -1.0)
-
-        if not scores:
-            return 0.0
-        return float(np.clip(float(np.mean(scores)), -1.0, 1.0))
+        return [cls.json_focused]
 
 class TRLGRPO2048Trainer:
     """High-level trainer using TRL GRPOTrainer."""
@@ -820,8 +945,8 @@ class TRLGRPO2048Trainer:
         batch_size: int = 2,
         gradient_accumulation_steps: int = 4,
         num_generations: int = 2,
-        max_prompt_length: int = 1024,
-        max_completion_length: int = 128,
+        max_prompt_length: int = 600,
+        max_completion_length: int = 768,
         save_steps: int = 200,
         logging_steps: int = 4,
     ):
@@ -883,7 +1008,7 @@ class TRLGRPO2048Trainer:
             "trainer": "trl_grpo",
             "model_name_or_path": self.model_name_or_path,
             "num_train_samples": len(dataset),
-            "reward_mode": "expert_shaped",
+            "reward_mode": "json_focused",
             "reward_config": vars(GRPO2048Rewards._cfg),
         }
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -909,12 +1034,10 @@ def _normalize_completion_text(text: str) -> str:
 
 
 def _parse_strict_action_id(text: str) -> Optional[int]:
-    """Parse action from strict output: `动作` or `<think>...</think> + 动作`."""
+    """Parse action from strict output JSON in non-think region only."""
     normalized = _normalize_completion_text(text)
-    match = _STRICT_ACTION_OUTPUT_RE.fullmatch(normalized)
-    if not match:
-        return None
-    return _ACTION_CHAR_TO_ID.get(match.group(1))
+    parsed = parse_action_from_non_think_text(normalized)
+    return int(parsed) if parsed is not None else None
 
 
 def _parse_action_id(text: str) -> Optional[int]:
@@ -945,46 +1068,6 @@ def _decode_action_token(token: str) -> Optional[int]:
     if token_norm in {"0", "1", "2", "3"}:
         return int(token_norm)
     return None
-
-
-def _extract_think_text(text: str) -> str:
-    normalized = _normalize_completion_text(text)
-    match = re.search(r"<think>\s*([\s\S]*?)\s*</think>", normalized, flags=re.I)
-    if match:
-        return match.group(1).strip()
-    return normalized
-
-
-def _extract_claimed_action_set(text: str) -> Optional[List[int]]:
-    segments = _VALID_ACTIONS_SEGMENT_RE.findall(text)
-    for seg in segments:
-        actions: List[int] = []
-        for ch in seg:
-            if ch in _ACTION_CHAR_TO_ID:
-                actions.append(int(_ACTION_CHAR_TO_ID[ch]))
-        for d in re.findall(r"[0-3]", seg):
-            actions.append(int(d))
-        for word in _ACTION_WORD_RE.findall(seg):
-            action_id = _ACTION_WORD_TO_ID.get(word.lower())
-            if action_id is not None:
-                actions.append(int(action_id))
-        if actions:
-            return sorted(set(actions))
-    return None
-
-
-def _extract_claimed_final_action(text: str) -> Optional[int]:
-    matches = _FINAL_ACTION_CLAIM_RE.findall(text)
-    if not matches:
-        return None
-    return _decode_action_token(matches[-1])
-
-
-def _mentions_corner_preserve(text: str) -> bool:
-    if "角" not in text:
-        return False
-    keywords = ["保持", "固定", "锁", "不要", "避免", "留在", "别把", "不能"]
-    return any(k in text for k in keywords)
 
 
 def _completion_to_text(completion: Any) -> str:
@@ -1099,29 +1182,32 @@ def main():
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
     parser.add_argument("--clip_eps", type=float, default=0.28)
     parser.add_argument("--kl_beta", type=float, default=0.0)
-    parser.add_argument("--max_prompt_length", type=int, default=512)
+    parser.add_argument("--max_prompt_length", type=int, default=600)
     parser.add_argument("--max_completion_length", type=int, default=768)
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument(
         "--reward_mode",
         type=str,
-        default="expert_shaped",
-        choices=["expert_shaped"],
-        help="GRPO reward mode (expert_shaped only)",
+        default="json_focused",
+        choices=["json_focused"],
+        help="GRPO reward mode (json_focused only)",
     )
-    parser.add_argument("--reward_format_penalty", type=float, default=-1.2)
-    parser.add_argument("--reward_illegal_penalty", type=float, default=-0.6)
-    parser.add_argument("--reward_legal_bonus", type=float, default=0.45)
-    parser.add_argument("--reward_format_quality_weight", type=float, default=0.05)
-    parser.add_argument("--reward_potential_norm", type=float, default=5.0)
-    parser.add_argument("--reward_w_score", type=float, default=0.20)
-    parser.add_argument("--reward_w_potential", type=float, default=0.25)
-    parser.add_argument("--reward_w_expert", type=float, default=0.35)
-    parser.add_argument("--reward_w_cot_facts", type=float, default=0.10)
-    parser.add_argument("--reward_w_cot_consistency", type=float, default=0.08)
+    parser.add_argument("--reward_json_invalid_penalty", type=float, default=-20.0)
     parser.add_argument("--reward_expert_depth", type=int, default=2)
     parser.add_argument("--reward_expert_max_empty", type=int, default=8)
+
+    # Deprecated legacy args kept for CLI compatibility; no longer used.
+    parser.add_argument("--reward_format_penalty", type=float, default=None)
+    parser.add_argument("--reward_illegal_penalty", type=float, default=None)
+    parser.add_argument("--reward_legal_bonus", type=float, default=None)
+    parser.add_argument("--reward_format_quality_weight", type=float, default=None)
+    parser.add_argument("--reward_potential_norm", type=float, default=None)
+    parser.add_argument("--reward_w_score", type=float, default=None)
+    parser.add_argument("--reward_w_potential", type=float, default=None)
+    parser.add_argument("--reward_w_expert", type=float, default=None)
+    parser.add_argument("--reward_w_cot_facts", type=float, default=None)
+    parser.add_argument("--reward_w_cot_consistency", type=float, default=None)
 
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument(
@@ -1188,17 +1274,8 @@ def main():
         monitor_backend=monitor_backend,
     )
 
-    reward_cfg = ExpertRewardConfig(
-        format_penalty=args.reward_format_penalty,
-        illegal_penalty=args.reward_illegal_penalty,
-        legal_bonus=args.reward_legal_bonus,
-        format_quality_weight=args.reward_format_quality_weight,
-        potential_norm=args.reward_potential_norm,
-        w_score=args.reward_w_score,
-        w_potential=args.reward_w_potential,
-        w_expert=args.reward_w_expert,
-        w_cot_facts=args.reward_w_cot_facts,
-        w_cot_consistency=args.reward_w_cot_consistency,
+    reward_cfg = JsonRewardConfig(
+        json_invalid_penalty=args.reward_json_invalid_penalty,
         expert_depth=args.reward_expert_depth,
         expert_max_empty=args.reward_expert_max_empty,
     )

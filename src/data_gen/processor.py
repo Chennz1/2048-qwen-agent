@@ -135,11 +135,29 @@ def games_to_training_format(
             continue
 
         for step_data in game["states"]:
+            action_json_text: Optional[str] = None
+            if "action_json" in step_data:
+                action_json_value = step_data.get("action_json")
+                if isinstance(action_json_value, dict):
+                    action_json_text = json.dumps(action_json_value, ensure_ascii=False)
+                elif isinstance(action_json_value, str):
+                    action_json_text = action_json_value.strip()
+                else:
+                    message = (
+                        f"Invalid action_json type from {json_file.name}, "
+                        f"step={step_data.get('step')}: {type(action_json_value).__name__}"
+                    )
+                    if strict_validation:
+                        raise ValueError(message)
+                    errors.append(message)
+                    continue
+
             messages = build_messages(
                 state_text=step_data["state"],
                 action=step_data["action"],
                 use_thinking=use_thinking,
                 thinking=step_data.get("thinking"),
+                action_json_text=action_json_text,
             )
 
             sample: Dict = {

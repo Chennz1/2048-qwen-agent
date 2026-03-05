@@ -57,6 +57,9 @@ except ImportError:
     PeftModel = None
     PEFT_AVAILABLE = False
 
+THINKING_PROMPT_MAX_LENGTH = 600
+THINKING_MAX_NEW_TOKENS = 768
+
 
 @dataclass
 class ReSTConfig:
@@ -157,7 +160,7 @@ class GamePlayer:
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=256
+            max_length=THINKING_PROMPT_MAX_LENGTH
         )
 
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
@@ -165,7 +168,7 @@ class GamePlayer:
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=256,  # thinking模式需要更多token
+                max_new_tokens=THINKING_MAX_NEW_TOKENS,
                 temperature=0.6,  # thinking模式最佳实践
                 top_p=0.95,
                 top_k=20,
@@ -520,7 +523,12 @@ class ReSTTrainer:
 
         for game in games:
             for state, action in zip(game['states'], game['actions']):
-                action_name = ACTION_MAP[action] if isinstance(action, int) else action
+                if isinstance(action, int):
+                    action_name = ACTION_MAP.get(action)
+                else:
+                    action_name = action if action in ACTION_MAP.values() else None
+                if action_name is None:
+                    continue
                 messages = build_messages(
                     state_text=state,
                     action=action_name,

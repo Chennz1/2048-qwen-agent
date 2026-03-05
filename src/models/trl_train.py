@@ -261,7 +261,9 @@ def _build_sft_config(
 ):
     """Build SFTConfig with runtime compatibility across TRL versions."""
     params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
-    seq_len = 2048 if use_unsloth else 512
+    # Thinking samples are typically prompt(500+) + completion(600+).
+    # Keep non-Unsloth SFT at 1536 to avoid truncating most samples.
+    seq_len = 2048 if use_unsloth else 1536
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
     kwargs = {
