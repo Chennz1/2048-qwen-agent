@@ -23,6 +23,7 @@ from src.models.grpo import (
     _THINK_BLOCK_RE,
     _THINK_CLOSE_RE,
     _build_grpo_config,
+    build_grpo_generation_kwargs,
     _load_trl_grpo_symbols,
     _normalize_completion_text,
     _patch_grpo_trainer_sampler_compat,
@@ -353,6 +354,7 @@ class TRLGRPONextBoardTrainer:
     ) -> Any:
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
         report_to = report_to_list(self.monitor_backend)
+        generation_kwargs = build_grpo_generation_kwargs(tokenizer)
         resolved_save_steps = resolve_save_steps(
             save_steps=save_steps,
             dataset_size=len(dataset),
@@ -376,6 +378,7 @@ class TRLGRPONextBoardTrainer:
             save_steps=resolved_save_steps,
             logging_steps=logging_steps,
             disable_tqdm=disable_tqdm,
+            generation_kwargs=generation_kwargs,
             report_to=report_to,
             clip_eps=clip_eps,
             kl_beta=kl_beta,

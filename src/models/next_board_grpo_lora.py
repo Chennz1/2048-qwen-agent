@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM
 
 from src.models.grpo import (
     _build_grpo_config,
+    build_grpo_generation_kwargs,
     _load_trl_grpo_symbols,
     _patch_grpo_trainer_sampler_compat,
     _resolve_grpo_model_input,
@@ -115,6 +116,7 @@ class TRLGRPONextBoardLoraTrainer:
     ) -> Any:
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
         report_to = report_to_list(self.monitor_backend)
+        generation_kwargs = build_grpo_generation_kwargs(tokenizer)
         resolved_save_steps = resolve_save_steps(
             save_steps=save_steps,
             dataset_size=len(dataset),
@@ -138,6 +140,7 @@ class TRLGRPONextBoardLoraTrainer:
             save_steps=resolved_save_steps,
             logging_steps=logging_steps,
             disable_tqdm=disable_tqdm,
+            generation_kwargs=generation_kwargs,
             report_to=report_to,
             clip_eps=clip_eps,
             kl_beta=kl_beta,
@@ -224,7 +227,7 @@ def main() -> None:
     parser.add_argument("--clip_eps", type=float, default=0.28)
     parser.add_argument("--kl_beta", type=float, default=0.0)
     parser.add_argument("--max_prompt_length", type=int, default=4096)
-    parser.add_argument("--max_completion_length", type=int, default=4096)
+    parser.add_argument("--max_completion_length", type=int, default=256)
     parser.add_argument("--save_steps", type=float, default=500)
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--disable_tqdm", action="store_true")

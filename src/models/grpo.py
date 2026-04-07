@@ -156,6 +156,7 @@ def _build_grpo_config(
     save_steps: int,
     logging_steps: int,
     disable_tqdm: bool,
+    generation_kwargs: Optional[Dict[str, Any]],
     report_to: List[str],
     clip_eps: float,
     kl_beta: float,
@@ -180,6 +181,7 @@ def _build_grpo_config(
         "save_steps": save_steps,
         "disable_tqdm": bool(disable_tqdm),
         "logging_steps": logging_steps,
+        "generation_kwargs": generation_kwargs,
         "report_to": report_to,
         "use_vllm": False,  # 关闭 vLLM 以省下预分配显存
         "gradient_checkpointing": True,  # 开启梯度检查点，极大降低反向传播时的显存峰值
@@ -277,6 +279,29 @@ def resolve_save_steps(
         f"-> every {resolved} update steps (estimated total steps: {total_steps})"
     )
     return resolved
+
+
+def build_grpo_generation_kwargs(tokenizer: Optional[Any]) -> Optional[Dict[str, Any]]:
+    """Build generation kwargs that keep rollout behavior close to notebook inference."""
+    if tokenizer is None:
+        return None
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+
+    kwargs: Dict[str, Any] = {
+        "do_sample": True,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+    }
+    if eos_token_id is not None:
+        kwargs["eos_token_id"] = int(eos_token_id)
+    if pad_token_id is not None:
+        kwargs["pad_token_id"] = int(pad_token_id)
+    return kwargs
 
 
 @dataclass
@@ -1001,6 +1026,7 @@ class TRLGRPO2048Trainer:
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
 
         report_to = report_to_list(self.monitor_backend)
+        generation_kwargs = build_grpo_generation_kwargs(tokenizer)
         resolved_save_steps = resolve_save_steps(
             save_steps=save_steps,
             dataset_size=len(dataset),
@@ -1024,6 +1050,7 @@ class TRLGRPO2048Trainer:
             save_steps=resolved_save_steps,
             logging_steps=logging_steps,
             disable_tqdm=disable_tqdm,
+            generation_kwargs=generation_kwargs,
             report_to=report_to,
             clip_eps=clip_eps,
             kl_beta=kl_beta,

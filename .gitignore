@@ -7,3 +7,4 @@ checkpoints/
 cache/
 *test*
 conf.md
+data/
