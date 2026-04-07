@@ -51,6 +51,7 @@ def _load_model_with_optional_lora(
         torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
+        attn_implementation="flash_attention_2"
     )
 
     preset = get_preset_config(model_name_or_path)
@@ -223,7 +224,7 @@ def main() -> None:
     parser.add_argument("--clip_eps", type=float, default=0.28)
     parser.add_argument("--kl_beta", type=float, default=0.0)
     parser.add_argument("--max_prompt_length", type=int, default=4096)
-    parser.add_argument("--max_completion_length", type=int, default=256)
+    parser.add_argument("--max_completion_length", type=int, default=4096)
     parser.add_argument("--save_steps", type=float, default=500)
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--disable_tqdm", action="store_true")

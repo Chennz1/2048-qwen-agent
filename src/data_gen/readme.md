@@ -119,3 +119,67 @@
 ## 扩展建议
 - 新增字段时先改 `contracts.py`，再改 `processor.py` 和测试。
 - 增加新模板时统一放在 `prompting.py`，避免训练/推理两套逻辑分叉。
+
+我已经给你实现了一套基于 src/data_gen/next_board_processor.py 生成数据的短链 SFT 数据处理代码：
+
+  - 新文件：src/data_gen/next_board_sft_processor.py
+  - 测试：tests/test_next_board_sft_processor.py
+
+  这套 SFT prompt 的核心设计是：
+
+  Simulate exactly one 2048 move.
+
+  The board is 4 rows by 4 columns: board[r][c].
+  Row 0 is top, row 3 is bottom, column 0 is left, column 3 is right.
+
+  Apply the rule to each affected line only:
+  1. remove zeros
+  2. merge adjacent equal tiles once
+  3. pad zeros on the far side
+
+  UP/DOWN operate on columns.
+  LEFT/RIGHT operate on rows.
+  Rebuild the final answer as 4 rows.
+
+  If you think, keep it short:
+  - line 1: which lines are affected
+  - line 2: one or two example transformations
+  - line 3: rebuild rows
+
+  Output the final answer as strict JSON after </think>.
+
+  assistant 目标会被构造成这种格式：
+
+  <think>
+  RIGHT uses rows.
+  r0: [4, 8, 4, 0]->[0, 4, 8, 4]; r1: [4, 32, 32, 0]->[0, 0, 4, 64]
+  Rebuild 4 rows -> [[0, 4, 8, 4], [0, 0, 4, 64], [0, 0, 0, 0], [0, 0, 0, 4]]
+  </think>
+
+  {"next_board": [[0, 4, 8, 4], [0, 0, 4, 64], [0, 0, 0, 0], [0, 0, 0, 4]]}
+
+  我已经实际跑通了数据转换命令：
+
+  python -m src.data_gen.next_board_sft_processor \
+    --input_dir data/processed_next_board \
+    --output_dir /tmp/processed_next_board_sft
+
+  你可以正式生成到项目目录：
+
+  python -m src.data_gen.next_board_sft_processor \
+    --input_dir data/processed_next_board \
+    --output_dir data/processed_next_board_sft
+
+  然后直接用现有 SFT 训练入口训练：
+
+  python -m src.models.trl_train \
+    --mode sft \
+    --model Qwen/Qwen3-1.7B-Instruct \
+    --train_data data/processed_next_board_sft/train \
+    --val_data data/processed_next_board_sft/val \
+    --output_dir checkpoints/sft_next_board_short_cot \
+    --epochs 3 \
+    --batch_size 1 \
+    --grad_accum 8 \
+    --lr 5e-5 \
+    --monitor_backend none

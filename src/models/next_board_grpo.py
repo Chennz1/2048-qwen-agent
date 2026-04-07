@@ -43,6 +43,10 @@ _DIRECTION_TO_ID = {
     "DOWN": 2,
     "LEFT": 3,
 }
+_FENCED_JSON_RE = re.compile(
+    r"^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$",
+    flags=re.I,
+)
 
 
 @dataclass
@@ -58,6 +62,8 @@ class NextBoardRewardConfig:
     wrong_cell_penalty: float = -0.10
     exact_row_bonus: float = 0.5
     exact_board_bonus: float = 6.0
+    compact_exact_bonus_max: float = 1.0
+    compact_extra_char_penalty: float = 0.01
     consistent_with_env_bonus: float = 2.0
     inconsistent_with_env_penalty: float = -2.0
     cot_length_threshold: int = 80
@@ -174,39 +180,56 @@ class NextBoardGRPORewards:
         return str(match.group(1) or "").strip()
 
     @classmethod
-    def _parse_predicted_next_board(cls, text: str) -> Tuple[Optional[List[List[int]]], float]:
+    def _unwrap_json_candidate(cls, text: str) -> str:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return ""
+        fenced = _FENCED_JSON_RE.match(stripped)
+        if fenced is not None:
+            return str(fenced.group(1) or "").strip()
+        return stripped
+
+    @classmethod
+    def _compact_json_text(cls, next_board: List[List[int]]) -> str:
+        return json.dumps({"next_board": next_board}, ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def _parse_predicted_next_board(
+        cls,
+        text: str,
+    ) -> Tuple[Optional[List[List[int]]], float, str]:
         format_score = 0.0
-        candidate = cls._extract_non_think_region(text)
+        candidate = cls._unwrap_json_candidate(cls._extract_non_think_region(text))
         if not candidate:
-            return None, float(cls._cfg.json_invalid_penalty)
+            return None, float(cls._cfg.json_invalid_penalty), ""
 
         try:
             payload = json.loads(candidate)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return None, float(cls._cfg.json_invalid_penalty)
+            return None, float(cls._cfg.json_invalid_penalty), candidate
 
         if set(payload.keys()) == {"next_board"}:
             format_score += float(cls._cfg.top_level_ok_bonus)
         else:
-            return None, float(cls._cfg.json_invalid_penalty + cls._cfg.top_level_bad_penalty)
+            return None, float(cls._cfg.json_invalid_penalty + cls._cfg.top_level_bad_penalty), candidate
 
         board = payload.get("next_board")
         if not isinstance(board, list) or len(board) != 4:
-            return None, float(format_score + cls._cfg.shape_bad_penalty)
+            return None, float(format_score + cls._cfg.shape_bad_penalty), candidate
         format_score += float(cls._cfg.shape_ok_bonus)
 
         typed_rows: List[List[int]] = []
         for row in board:
             if not isinstance(row, list) or len(row) != 4:
-                return None, float(format_score + cls._cfg.shape_bad_penalty)
+                return None, float(format_score + cls._cfg.shape_bad_penalty), candidate
             typed_row: List[int] = []
             for value in row:
                 if not isinstance(value, int) or isinstance(value, bool):
-                    return None, float(format_score + cls._cfg.value_type_bad_penalty)
+                    return None, float(format_score + cls._cfg.value_type_bad_penalty), candidate
                 typed_row.append(int(value))
             typed_rows.append(typed_row)
         format_score += float(cls._cfg.value_type_ok_bonus)
-        return typed_rows, float(format_score)
+        return typed_rows, float(format_score), candidate
 
     @classmethod
     def next_board_accuracy(cls, completions: List[Any], **kwargs) -> List[float]:
@@ -218,7 +241,7 @@ class NextBoardGRPORewards:
         for idx, completion in enumerate(completions):
             text = _completion_to_text(completion)
             think_text = cls._extract_think_region(text)
-            predicted_board, format_score = cls._parse_predicted_next_board(text)
+            predicted_board, format_score, parsed_json_text = cls._parse_predicted_next_board(text)
             if len(think_text) > int(cls._cfg.cot_length_threshold):
                 format_score += float(cls._cfg.cot_length_bonus)
 
@@ -258,6 +281,13 @@ class NextBoardGRPORewards:
                 if predicted_board == target_board:
                     correct = True
                     facts_score += float(cls._cfg.exact_board_bonus)
+                    compact_target = cls._compact_json_text(target_board)
+                    extra_chars = max(0, len(parsed_json_text) - len(compact_target))
+                    facts_score += max(
+                        0.0,
+                        float(cls._cfg.compact_exact_bonus_max)
+                        - float(cls._cfg.compact_extra_char_penalty) * float(extra_chars),
+                    )
                 if correct and legal:
                     all_correct_score += 1.0
             total_score = float(format_score + legal_score + facts_score + all_correct_score)
@@ -507,6 +537,8 @@ def main() -> None:
     parser.add_argument("--disable_tqdm", action="store_true")
     parser.add_argument("--reward_json_invalid_penalty", type=float, default=-20.0)
     parser.add_argument("--reward_exact_board_bonus", type=float, default=6.0)
+    parser.add_argument("--reward_compact_exact_bonus_max", type=float, default=1.0)
+    parser.add_argument("--reward_compact_extra_char_penalty", type=float, default=0.01)
     parser.add_argument("--reward_consistent_with_env_bonus", type=float, default=2.0)
     parser.add_argument("--reward_inconsistent_with_env_penalty", type=float, default=-2.0)
     parser.add_argument("--no_wandb", action="store_true")
@@ -543,6 +575,8 @@ def main() -> None:
         NextBoardRewardConfig(
             json_invalid_penalty=args.reward_json_invalid_penalty,
             exact_board_bonus=args.reward_exact_board_bonus,
+            compact_exact_bonus_max=args.reward_compact_exact_bonus_max,
+            compact_extra_char_penalty=args.reward_compact_extra_char_penalty,
             consistent_with_env_bonus=args.reward_consistent_with_env_bonus,
             inconsistent_with_env_penalty=args.reward_inconsistent_with_env_penalty,
         )
