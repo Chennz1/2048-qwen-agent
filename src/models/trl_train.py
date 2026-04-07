@@ -258,6 +258,7 @@ def _build_sft_config(
     load_in_8bit: bool,
     tokenizer=None,
     completion_only_loss: bool = True,
+    disable_tqdm: bool = False,
 ):
     """Build SFTConfig with runtime compatibility across TRL versions."""
     params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
@@ -274,7 +275,7 @@ def _build_sft_config(
         "learning_rate": learning_rate,
         "warmup_ratio": 0.1,
         "lr_scheduler_type": "cosine",
-        "disable_tqdm": True,
+        "disable_tqdm": bool(disable_tqdm),
         "logging_steps": 4,
         "save_strategy": "epoch",
         "save_total_limit": 3,
@@ -398,6 +399,7 @@ def train_sft(
     load_in_8bit: bool = False,
     use_flash_attn: bool = False,
     completion_only_loss: bool = True,
+    disable_tqdm: bool = False,
 ):
     """
     使用TRL的SFTTrainer进行监督微调
@@ -572,6 +574,7 @@ def train_sft(
         load_in_8bit=load_in_8bit,
         tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
+        disable_tqdm=disable_tqdm,
     )
 
     print(
@@ -711,6 +714,7 @@ def main():
         choices=["wandb", "tensorboard", "none"],
         help="监控后端 (wandb/tensorboard/none)",
     )
+    parser.add_argument("--disable_tqdm", action="store_true")
 
     # 优化选项
     parser.add_argument("--use_unsloth", action="store_true",
@@ -751,6 +755,7 @@ def main():
             load_in_4bit=args.load_in_4bit,
             load_in_8bit=args.load_in_8bit,
             use_flash_attn=args.use_flash_attn,
+            disable_tqdm=args.disable_tqdm,
         )
 
         print("\n✅ SFT训练完成!")

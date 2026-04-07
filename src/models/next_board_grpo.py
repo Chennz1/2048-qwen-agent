@@ -18,6 +18,7 @@ from datasets import Dataset, load_from_disk
 from transformers import AutoTokenizer
 
 from src.data_gen.next_board_processor import simulate_next_board
+from src.data_gen.next_board_sft_processor import SHORT_THINKING_SYSTEM_PROMPT
 from src.models.grpo import (
     _THINK_BLOCK_RE,
     _THINK_CLOSE_RE,
@@ -100,8 +101,12 @@ class NextBoardGRPODatasetBuilder:
             if board is None or action_id is None or target_next_board is None:
                 continue
 
+            aligned_prompt_messages = [
+                {"role": "system", "content": SHORT_THINKING_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ]
             prompt = self.tokenizer.apply_chat_template(
-                prompt_messages,
+                aligned_prompt_messages,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=bool(self.use_thinking),
