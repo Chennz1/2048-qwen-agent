@@ -14,6 +14,7 @@ import ast
 import json
 import os
 import inspect
+import math
 import re
 import types
 from importlib.metadata import PackageNotFoundError, version
@@ -31,7 +32,7 @@ os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 from transformers import AutoTokenizer
 
 from src.data_gen.prompting import format_inference_prompt
-from src.envs.game_2048 import ACTION_MAP, Game2048, parse_action_from_non_think_text
+from src.envs.game_2048 import ACTION_MAP, ACTION_MAP_ENGLISH, Game2048, parse_action_from_non_think_text
 from src.utils.action_stats import ActionWindowStats
 from src.utils.monitoring import normalize_monitor_backend, report_to_list
 
@@ -51,9 +52,12 @@ _ACTION_WORD_TO_ID = {
     "down": 2,
     "left": 3,
 }
-_TOP_LEVEL_KEYS = {"局面", "判断", "选择"}
-_SITUATION_KEYS = {"最大数字", "位置", "在角落"}
-_JUDGMENT_KEYS = {"上", "右", "下", "左"}
+_TOP_LEVEL_KEYS_EN = {"board", "judgment", "choice"}
+_SITUATION_KEYS_EN = {"max_tile", "positions", "in_corner"}
+_JUDGMENT_KEYS_EN = {"UP", "RIGHT", "DOWN", "LEFT"}
+_TOP_LEVEL_KEYS_ZH = {"局面", "判断", "选择"}
+_SITUATION_KEYS_ZH = {"最大数字", "位置", "在角落"}
+_JUDGMENT_KEYS_ZH = {"上", "右", "下", "左"}
 
 
 def _load_trl_grpo_symbols():
@@ -151,6 +155,7 @@ def _build_grpo_config(
     max_completion_length: int,
     save_steps: int,
     logging_steps: int,
+    disable_tqdm: bool,
     report_to: List[str],
     clip_eps: float,
     kl_beta: float,
@@ -173,13 +178,16 @@ def _build_grpo_config(
         "max_prompt_length": max_prompt_length,
         "max_completion_length": max_completion_length,
         "save_steps": save_steps,
-        "disable_tqdm": True,
+        "disable_tqdm": bool(disable_tqdm),
         "logging_steps": logging_steps,
         "report_to": report_to,
-        "use_vllm": True,
-        "vllm_mode": "colocate",
-        "vllm_gpu_memory_utilization": 0.25,
-        "max_model_len": vllm_max_model_len,
+        "use_vllm": False,  # 关闭 vLLM 以省下预分配显存
+        "gradient_checkpointing": True,  # 开启梯度检查点，极大降低反向传播时的显存峰值
+        
+        # "use_vllm": True,
+        # "vllm_mode": "colocate",
+        # "vllm_gpu_memory_utilization": 0.25,
+        # "max_model_len": vllm_max_model_len,
     }
 
     # Length args vary across TRL versions. Provide fallbacks when canonical
@@ -242,6 +250,33 @@ def _resolve_grpo_model_input(model_name_or_path: str) -> Any:
     }
     filtered_kwargs = {k: v for k, v in load_kwargs.items() if k in load_params}
     return AutoPeftModelForCausalLM.from_pretrained(model_name_or_path, **filtered_kwargs)
+
+
+def resolve_save_steps(
+    *,
+    save_steps: float,
+    dataset_size: int,
+    num_train_epochs: int,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Resolve save_steps from either an absolute step count or a total-step ratio."""
+    value = float(save_steps)
+    if value <= 0:
+        raise ValueError(f"save_steps must be > 0, got {save_steps}")
+    if value >= 1:
+        return max(1, int(round(value)))
+
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    effective_batch = max(1, int(batch_size) * int(gradient_accumulation_steps) * world_size)
+    steps_per_epoch = max(1, int(math.ceil(float(dataset_size) / float(effective_batch))))
+    total_steps = max(1, int(math.ceil(float(num_train_epochs) * float(steps_per_epoch))))
+    resolved = max(1, int(math.ceil(total_steps * value)))
+    print(
+        f"[GRPO] Resolved save_steps ratio {value:.4f} "
+        f"-> every {resolved} update steps (estimated total steps: {total_steps})"
+    )
+    return resolved
 
 
 @dataclass
@@ -780,24 +815,28 @@ class GRPO2048Rewards:
                 for r, c in zip(*np.where(prev_grid == true_max_tile))
             }
             true_corner = any((r, c) in {(0, 0), (0, 3), (3, 0), (3, 3)} for r, c in true_positions)
-            true_judgment = {ACTION_MAP[a]: (a in valid_set) for a in range(4)}
-            top_level_ok = set(predicted.keys()) == _TOP_LEVEL_KEYS
+            true_judgment_en = {ACTION_MAP_ENGLISH[a]: (a in valid_set) for a in range(4)}
+            true_judgment_zh = {ACTION_MAP[a]: (a in valid_set) for a in range(4)}
+            is_english_schema = set(predicted.keys()) == _TOP_LEVEL_KEYS_EN
+            top_level_ok = is_english_schema or set(predicted.keys()) == _TOP_LEVEL_KEYS_ZH
             format_score += (
                 float(cls._cfg.top_level_ok_bonus)
                 if top_level_ok
                 else float(cls._cfg.top_level_bad_penalty)
             )
 
-            situation = predicted.get("局面")
+            situation = predicted.get("board") if is_english_schema else predicted.get("局面")
             pred_pos_set: Optional[set[tuple[int, int]]] = None
             if isinstance(situation, dict):
-                pred_pos_set = cls._coerce_position_set(situation.get("位置"))
+                pred_pos_set = cls._coerce_position_set(
+                    situation.get("positions") if is_english_schema else situation.get("位置")
+                )
             situation_schema_ok = (
                 isinstance(situation, dict)
-                and set(situation.keys()) == _SITUATION_KEYS
-                and cls._is_plain_int(situation.get("最大数字"))
+                and set(situation.keys()) == (_SITUATION_KEYS_EN if is_english_schema else _SITUATION_KEYS_ZH)
+                and cls._is_plain_int(situation.get("max_tile") if is_english_schema else situation.get("最大数字"))
                 and pred_pos_set is not None
-                and isinstance(situation.get("在角落"), bool)
+                and isinstance(situation.get("in_corner") if is_english_schema else situation.get("在角落"), bool)
             )
             format_score += (
                 float(cls._cfg.situation_schema_ok_bonus)
@@ -805,10 +844,10 @@ class GRPO2048Rewards:
                 else float(cls._cfg.situation_schema_bad_penalty)
             )
 
-            judgment = predicted.get("判断")
+            judgment = predicted.get("judgment") if is_english_schema else predicted.get("判断")
             judgment_schema_ok = (
                 isinstance(judgment, dict)
-                and set(judgment.keys()) == _JUDGMENT_KEYS
+                and set(judgment.keys()) == (_JUDGMENT_KEYS_EN if is_english_schema else _JUDGMENT_KEYS_ZH)
                 and all(isinstance(v, bool) for v in judgment.values())
             )
             format_score += (
@@ -817,9 +856,9 @@ class GRPO2048Rewards:
                 else float(cls._cfg.judgment_schema_bad_penalty)
             )
 
-            choice_raw = predicted.get("选择")
+            choice_raw = predicted.get("choice") if is_english_schema else predicted.get("选择")
             choice_name = choice_raw.strip() if isinstance(choice_raw, str) else None
-            choice_id = _ACTION_CHAR_TO_ID.get(choice_name or "")
+            choice_id = _decode_action_token(choice_name or "")
             choice_schema_ok = choice_id is not None
             format_score += (
                 float(cls._cfg.choice_schema_ok_bonus)
@@ -830,7 +869,11 @@ class GRPO2048Rewards:
                 top_level_ok and situation_schema_ok and judgment_schema_ok and choice_schema_ok
             )
 
-            pred_max_tile = situation.get("最大数字") if isinstance(situation, dict) else None
+            pred_max_tile = (
+                situation.get("max_tile") if is_english_schema and isinstance(situation, dict)
+                else situation.get("最大数字") if isinstance(situation, dict)
+                else None
+            )
             if cls._is_plain_int(pred_max_tile) and int(pred_max_tile) == true_max_tile:
                 facts_score += float(cls._cfg.max_tile_correct_bonus)
                 max_tile_ok = True
@@ -845,7 +888,11 @@ class GRPO2048Rewards:
                 facts_score += float(cls._cfg.positions_wrong_penalty)
                 positions_ok = False
 
-            pred_corner = situation.get("在角落") if isinstance(situation, dict) else None
+            pred_corner = (
+                situation.get("in_corner") if is_english_schema and isinstance(situation, dict)
+                else situation.get("在角落") if isinstance(situation, dict)
+                else None
+            )
             if isinstance(pred_corner, bool) and bool(pred_corner) == bool(true_corner):
                 facts_score += float(cls._cfg.corner_correct_bonus)
                 corner_ok = True
@@ -856,8 +903,8 @@ class GRPO2048Rewards:
 
             all_judgment_ok = True
             for action_id in range(4):
-                action_name = ACTION_MAP[action_id]
-                expected = true_judgment[action_name]
+                action_name = ACTION_MAP_ENGLISH[action_id] if is_english_schema else ACTION_MAP[action_id]
+                expected = true_judgment_en[action_name] if is_english_schema else true_judgment_zh[action_name]
                 pred_val = judgment.get(action_name) if isinstance(judgment, dict) else None
                 if isinstance(pred_val, bool) and pred_val == expected:
                     legal_score += float(cls._cfg.judgment_match_bonus)
@@ -947,12 +994,20 @@ class TRLGRPO2048Trainer:
         num_generations: int = 2,
         max_prompt_length: int = 600,
         max_completion_length: int = 768,
-        save_steps: int = 200,
+        save_steps: float = 200,
         logging_steps: int = 4,
+        disable_tqdm: bool = False,
     ):
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
 
         report_to = report_to_list(self.monitor_backend)
+        resolved_save_steps = resolve_save_steps(
+            save_steps=save_steps,
+            dataset_size=len(dataset),
+            num_train_epochs=num_train_epochs,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
 
         cfg = _build_grpo_config(
             GRPOConfig=GRPOConfig,
@@ -966,8 +1021,9 @@ class TRLGRPO2048Trainer:
             num_generations=num_generations,
             max_prompt_length=max_prompt_length,
             max_completion_length=max_completion_length,
-            save_steps=save_steps,
+            save_steps=resolved_save_steps,
             logging_steps=logging_steps,
+            disable_tqdm=disable_tqdm,
             report_to=report_to,
             clip_eps=clip_eps,
             kl_beta=kl_beta,
@@ -1184,8 +1240,9 @@ def main():
     parser.add_argument("--kl_beta", type=float, default=0.0)
     parser.add_argument("--max_prompt_length", type=int, default=600)
     parser.add_argument("--max_completion_length", type=int, default=768)
-    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--save_steps", type=float, default=1000)
     parser.add_argument("--logging_steps", type=int, default=5)
+    parser.add_argument("--disable_tqdm", action="store_true")
     parser.add_argument(
         "--reward_mode",
         type=str,
@@ -1297,6 +1354,7 @@ def main():
         max_completion_length=args.max_completion_length,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
+        disable_tqdm=args.disable_tqdm,
     )
 
 

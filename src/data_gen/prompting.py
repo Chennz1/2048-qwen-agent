@@ -8,40 +8,40 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 
-from src.envs.game_2048 import ACTION_MAP
+from src.envs.game_2048 import ACTION_MAP, ACTION_MAP_ENGLISH
 
 GAME_SYSTEM_PROMPT = """
-你是 2048 游戏 AI。请分析输入的 4x4 棋盘数组，并给出当前最优方向（上/右/下/左）。
+You are a 2048 game AI. Analyze the input 4x4 board and choose the best direction (UP/RIGHT/DOWN/LEFT).
 
-# 简明游戏规则
-1. `0` 表示空位,非零数字则代表一个方块。
-2. 每步只能选一个方向，所有方块先向该方向滑动压缩。
-3. 压缩后相邻且相同的非零方块合并为和；原本隔空位可在压缩后合并；被不同数值阻挡时不能跨越合并；单个方块每步最多合并一次。
-4. 执行后棋盘有变化（移动或合并）即合法；完全不变即非法。
+# Rules
+1. `0` means an empty cell and any non-zero value is a tile.
+2. Each move chooses exactly one direction, and all tiles slide in that direction first.
+3. After sliding, adjacent equal non-zero tiles merge into their sum. Tiles separated by zeros may merge after compression. Tiles blocked by different values cannot merge across them. A tile can merge at most once per move.
+4. A move is legal if the board changes after execution, either by sliding or merging. If the board stays exactly the same, the move is illegal.
 
-# 输出要求
-输出一个 JSON 对象，格式如下：
-1. "局面": object
-   - "最大数字": int，表示当前棋盘中的最大数值。
-   - "位置": list，表示所有最大数字坐标；每个坐标格式为 [行, 列]（0-based）。
-   - "在角落": bool，表示是否至少有一个最大数字位于四个角之一。
-2. "判断": object
-   - 固定包含四个键："上"、"右"、"下"、"左"。
-   - 每个键的值为 bool，表示该方向本步是否为合法动作。
-3. "选择": string
-   - 表示最终动作方向，只能是 "上"、"右"、"下"、"左" 之一。
+# Output Format
+Return one JSON object with this schema:
+1. "board": object
+   - "max_tile": int, the largest value on the current board.
+   - "positions": list, all coordinates of the largest value; each coordinate is [row, col] with 0-based indexing.
+   - "in_corner": bool, whether at least one largest tile is in a corner.
+2. "judgment": object
+   - Must contain exactly four keys: "UP", "RIGHT", "DOWN", "LEFT".
+   - Each value is a bool indicating whether that direction is legal for this move.
+3. "choice": string
+   - The final chosen direction, and it must be one of "UP", "RIGHT", "DOWN", "LEFT".
 
-# 示例
-输入：
+# Example
+Input:
 [[2, 2, 4, 8],
 [4, 0, 0, 8],
 [0, 0, 0, 0],
 [0, 0, 0, 0]]
-输出：
+Output:
 {
-  "局面": {"最大数字": 8, "位置": [[0, 3], [1, 3]], "在角落": true},
-  "判断": {"上": false, "右": true, "下": true, "左": true},
-  "选择": "右"
+  "board": {"max_tile": 8, "positions": [[0, 3], [1, 3]], "in_corner": true},
+  "judgment": {"UP": false, "RIGHT": true, "DOWN": true, "LEFT": true},
+  "choice": "RIGHT"
 }
 """
 
@@ -49,11 +49,11 @@ GAME_SYSTEM_PROMPT = """
 
 def build_user_prompt(state_text: str, use_thinking: bool) -> str:
     return f"""{GAME_SYSTEM_PROMPT}
-# 当前输入
+# Current Input
 {state_text}
 
-# 输出限制
-只输出一个 JSON 对象，不要输出代码块、解释或额外文本。
+# Output Restriction
+Return exactly one JSON object. Do not output code fences, explanations, or any extra text.
 """
 
 
@@ -125,13 +125,15 @@ def _valid_action_ids_from_grid(grid: np.ndarray) -> Set[int]:
 
 
 def build_action_json_text(state_text: str, action: str) -> str:
-    action_name = str(action or "").strip()
+    action_lookup = {name: idx for idx, name in ACTION_MAP.items()}
+    english_choice = ACTION_MAP_ENGLISH.get(action_lookup.get(str(action or "").strip()))
+    action_name = english_choice or str(action or "").strip().upper()
     grid = _parse_grid(state_text)
     if grid is None:
         payload = {
-            "局面": {"最大数字": 0, "位置": [], "在角落": False},
-            "判断": {"上": False, "右": False, "下": False, "左": False},
-            "选择": action_name,
+            "board": {"max_tile": 0, "positions": [], "in_corner": False},
+            "judgment": {"UP": False, "RIGHT": False, "DOWN": False, "LEFT": False},
+            "choice": action_name,
         }
         return json.dumps(payload, ensure_ascii=False)
 
@@ -145,16 +147,16 @@ def build_action_json_text(state_text: str, action: str) -> str:
     in_corner = any((i, j) in {(0, 0), (0, 3), (3, 0), (3, 3)} for i, j in positions)
 
     valid_ids = _valid_action_ids_from_grid(arr)
-    judgment = {ACTION_MAP[i]: (i in valid_ids) for i in range(4)}
+    judgment = {ACTION_MAP_ENGLISH[i]: (i in valid_ids) for i in range(4)}
 
     payload = {
-        "局面": {
-            "最大数字": max_tile,
-            "位置": positions,
-            "在角落": bool(in_corner),
+        "board": {
+            "max_tile": max_tile,
+            "positions": positions,
+            "in_corner": bool(in_corner),
         },
-        "判断": judgment,
-        "选择": action_name,
+        "judgment": judgment,
+        "choice": action_name,
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -172,7 +174,10 @@ def build_assistant_content(
         action=action,
     )
     if use_thinking:
-        thinking_text = (thinking or "分析当前局势，优先保持大数字在角落并寻找可合并方向。").strip()
+        thinking_text = (
+            thinking
+            or "Analyze the board, keep the largest tile stable, and prefer a direction that preserves structure or creates merges."
+        ).strip()
         return f"<think>\n{thinking_text}\n</think>\n\n{action_json}"
     return action_json
 

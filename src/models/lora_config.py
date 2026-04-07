@@ -204,6 +204,6 @@ if __name__ == "__main__":
     print_model_info(model, tokenizer)
 
     # Test tokenization
-    test_text = "当前棋盘状态(4x4数组，0表示空位):\n[[2, 4, 8, 16],\n [4, 8, 16, 32],\n [0, 0, 0, 0],\n [0, 0, 0, 0]]\n\n请选择最佳着法:"
+    test_text = "Current board state (4x4 array, 0 means empty):\n[[2, 4, 8, 16],\n [4, 8, 16, 32],\n [0, 0, 0, 0],\n [0, 0, 0, 0]]\n\nChoose the best move:"
     tokens = tokenizer(test_text, return_tensors="pt")
     print(f"\nTest text length: {len(tokens['input_ids'][0])} tokens")

@@ -1,9 +1,12 @@
 # 默认不安装 torch/torchvision/torchaudio，避免覆盖你已配置好的 CUDA/PyTorch 环境。
 # 如果需要“从零安装 torch”，请使用 requirements-cuda12.txt。
+torch>=2.10.0
+torchvision>=0.15.0
+
 transformers>=4.45.0
 
 # TRL和PEFT (核心)
-trl>=0.15.0           # HuggingFace RL库（本项目GRPO需 GRPOTrainer/GRPOConfig）
+trl>=1.0.0           # HuggingFace RL库（本项目GRPO需 GRPOTrainer/GRPOConfig）
 peft>=0.12.0          # LoRA等高效微调方法
 
 # 数据处理
@@ -41,7 +44,7 @@ bitsandbytes>=0.43.0 # 4-bit/8-bit量化（CUDA 12.x 建议 0.43+）
 # flash-attn>=2.0.0  # Flash Attention 2 (需要CUDA) - 编译慢，见下方快速安装方案
 
 # 组合2: vLLM + INT8量化 (推理优化 10-50x)
-vllm>=0.6.0          # 高性能推理引擎 (PagedAttention)
+vllm>=0.17.1          # 高性能推理引擎 (PagedAttention)
 
 # ==============================================================================
 # Flash Attention 2 信息

@@ -653,7 +653,7 @@ def train_with_custom_reward(
     print("🎮 加载模型...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
     )
 

@@ -60,7 +60,33 @@
 - 路径：`data/raw/*.json`
 - 关键字段：
   - 顶层：`schema_version`, `game_id`, `difficulty`, `states`, `final_score`, `max_tile`, `total_steps`
-  - `states[i]`：`state`, `action`, `action_id`, `action_json`, `score`, `step`, `thinking?`
+  - `states[i]`：`state`, `action`, `action_id`, `action_json`, `score`, `step`, `thinking?`, `info?`
+
+#### `states[i].info`（Human-Lite，可选）
+- 设计目标：仅保留“人眼快速可识别”的局面信息，避免复杂搜索值。
+- 字段结构：
+  - `info_version`：当前固定 `human_lite_v1`
+  - `board_observation`：棋盘直观信息
+    - `max_tile`：当前最大数字
+    - `max_tile_positions`：最大数字位置列表（0-based）
+    - `empty_cells`：空位数量
+    - `non_zero_cells`：非空位数量
+    - `max_tile_in_corner`：最大数字是否在角落
+    - `max_tile_corner_name`：角落名称（若不在角落则为 `null`）
+  - `visible_patterns`：可见结构线索
+    - `adjacent_equal_pairs_count`：相邻相等对数量（水平+垂直）
+    - `near_merge_lines`：可见合并线索所在的行/列（如 `第1行`、`第3列`）
+  - `action_space`：动作空间事实
+    - `valid_actions`：合法动作ID列表
+    - `valid_action_names`：合法动作中文名
+    - `invalid_action_names`：非法动作中文名
+  - `chosen`：最终动作与简短理由
+    - `action_id` / `action_name`
+    - `reason_tags`：`keep_corner_max` / `seek_merge` / `keep_space` / `avoid_dead_end`
+    - `reason_text_short`：简短自然语言理由
+
+#### 动作ID映射
+- `0=上`, `1=右`, `2=下`, `3=左`
 
 ### 输出：processed 训练集
 - 路径：`data/processed/{train,val,test}`

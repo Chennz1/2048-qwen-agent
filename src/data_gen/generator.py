@@ -11,8 +11,9 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Tuple
+from multiprocessing import Pool, cpu_count
 import numpy as np
-
+from tqdm import tqdm
 from src.envs.game_2048 import Game2048, ACTION_MAP
 from src.data_gen.contracts import SCHEMA_VERSION
 from src.data_gen.prompting import build_action_json_text
@@ -1371,6 +1372,136 @@ class ThinkingHeuristicPlayer:
         """Random action"""
         return random.choice(valid_actions)
 
+    def _max_tile_positions_from_grid(self, grid: np.ndarray, max_tile: int) -> List[List[int]]:
+        positions: List[List[int]] = []
+        for r in range(4):
+            for c in range(4):
+                if int(grid[r, c]) == int(max_tile):
+                    positions.append([int(r), int(c)])
+        return positions
+
+    def _count_adjacent_equal_pairs(self, grid: np.ndarray) -> int:
+        """Count immediate adjacent equal pairs (right/down only, no double-count)."""
+        pairs = 0
+        for r in range(4):
+            for c in range(4):
+                v = int(grid[r, c])
+                if v <= 0:
+                    continue
+                if c + 1 < 4 and int(grid[r, c + 1]) == v:
+                    pairs += 1
+                if r + 1 < 4 and int(grid[r + 1, c]) == v:
+                    pairs += 1
+        return int(pairs)
+
+    def _near_merge_lines(self, grid: np.ndarray) -> List[str]:
+        """Return row/column labels that contain visible adjacent equal pairs."""
+        lines: List[str] = []
+        for r in range(4):
+            has_pair = any(
+                int(grid[r, c]) > 0 and int(grid[r, c]) == int(grid[r, c + 1])
+                for c in range(3)
+            )
+            if has_pair:
+                lines.append(f"第{r + 1}行")
+
+        for c in range(4):
+            has_pair = any(
+                int(grid[r, c]) > 0 and int(grid[r, c]) == int(grid[r + 1, c])
+                for r in range(3)
+            )
+            if has_pair:
+                lines.append(f"第{c + 1}列")
+        return lines
+
+    def _build_human_reason_tags(
+        self,
+        *,
+        chosen_action: int,
+        diagnostics: Dict[int, Dict[str, Any]],
+        max_tile_in_corner: bool,
+        empty_cells: int,
+        valid_actions: List[int],
+    ) -> List[str]:
+        tags: List[str] = []
+        chosen_diag = diagnostics.get(chosen_action, {})
+
+        if max_tile_in_corner and chosen_diag.get("preserves_corner") is True:
+            tags.append("keep_corner_max")
+        if int(chosen_diag.get("score_gain", 0)) > 0:
+            tags.append("seek_merge")
+        if empty_cells <= 3 or int(chosen_diag.get("empty_delta", 0)) >= 0:
+            tags.append("keep_space")
+        if len(valid_actions) <= 2:
+            tags.append("avoid_dead_end")
+
+        if not tags:
+            tags.append("keep_space")
+        return tags
+
+    def build_human_lite_info(self, game: Game2048, chosen_action: int) -> Dict[str, Any]:
+        """Build human-observable, low-complexity info for prompt reconstruction."""
+        grid = np.array(game.grid, copy=True)
+        max_tile = int(np.max(grid))
+        max_positions = self._max_tile_positions_from_grid(grid, max_tile)
+        empty_cells = int(np.sum(grid == 0))
+        non_zero_cells = int(np.sum(grid > 0))
+        valid_actions = list(game.get_valid_actions())
+        valid_action_names = [ACTION_MAP[a] for a in valid_actions]
+        invalid_action_names = [ACTION_MAP[a] for a in range(4) if a not in valid_actions]
+
+        diagnostics = self._collect_action_diagnostics(game)
+
+        max_tile_in_corner = False
+        max_tile_corner_name: Optional[str] = None
+        if len(max_positions) == 1:
+            pos_tuple = (int(max_positions[0][0]), int(max_positions[0][1]))
+            max_tile_corner_name = self.CORNER_NAMES.get(pos_tuple)
+            max_tile_in_corner = max_tile_corner_name is not None
+
+        reason_tags = self._build_human_reason_tags(
+            chosen_action=chosen_action,
+            diagnostics=diagnostics,
+            max_tile_in_corner=max_tile_in_corner,
+            empty_cells=empty_cells,
+            valid_actions=valid_actions,
+        )
+
+        reason_map = {
+            "keep_corner_max": "保持最大块在角落",
+            "seek_merge": "优先争取可见合并",
+            "keep_space": "尽量保持可操作空间",
+            "avoid_dead_end": "可选动作较少时优先避免死局",
+        }
+        reason_text_short = "；".join(reason_map[tag] for tag in reason_tags if tag in reason_map)
+
+        return {
+            "info_version": "human_lite_v1",
+            "board_observation": {
+                "max_tile": max_tile,
+                "max_tile_positions": max_positions,
+                "empty_cells": empty_cells,
+                "non_zero_cells": non_zero_cells,
+                "max_tile_in_corner": bool(max_tile_in_corner),
+                "max_tile_corner_name": max_tile_corner_name,
+            },
+            "visible_patterns": {
+                "adjacent_equal_pairs_count": self._count_adjacent_equal_pairs(grid),
+                "near_merge_lines": self._near_merge_lines(grid),
+            },
+            "action_space": {
+                "valid_actions": valid_actions,
+                "valid_action_names": valid_action_names,
+                "invalid_action_names": invalid_action_names,
+            },
+            "chosen": {
+                "action_id": int(chosen_action),
+                "action_name": ACTION_MAP[chosen_action],
+                "reason_tags": reason_tags,
+                "reason_text_short": reason_text_short,
+            },
+        }
+
     def _expert_action(self, game: Game2048, valid_actions: List[int]) -> int:
         """Expert strategy: expectimax search with stochastic spawn modeling."""
         if self.expert_policy is None:
@@ -1733,6 +1864,108 @@ class ThinkingHeuristicPlayer:
         return smoothness
 
 
+def _generate_single_game(
+    game_idx: int,
+    game_seed: Optional[int],
+    max_steps: int,
+    difficulty: DifficultyLevel,
+    with_thinking: bool,
+    enable_diversity: bool,
+    expert_depth: int,
+    expert_max_empty: int,
+) -> Dict[str, Any]:
+    """
+    Generate a single game (for multiprocessing).
+
+    Args:
+        game_idx: Game index
+        game_seed: Seed for this game
+        max_steps: Maximum steps per game
+        difficulty: Difficulty level
+        with_thinking: Whether to include thinking
+        enable_diversity: Diversity flag
+        expert_depth: Expert search depth
+        expert_max_empty: Expert max empty branches
+
+    Returns:
+        Single game data dictionary
+    """
+    from src.envs.game_2048 import Game2048, ACTION_MAP
+    from src.data_gen.prompting import build_action_json_text
+    from src.data_gen.contracts import SCHEMA_VERSION
+
+    # Create player and game for this process
+    player = ThinkingHeuristicPlayer(
+        difficulty=difficulty,
+        seed=None,
+        enable_diversity=enable_diversity,
+        expert_depth=expert_depth,
+        expert_max_empty=expert_max_empty,
+    )
+
+    game = Game2048(seed=game_seed)
+    states = []
+    actions = []
+    scores = []
+    steps = []
+    thinkings = [] if with_thinking else None
+    infos: List[Dict[str, Any]] = []
+    action_jsons: List[str] = []
+
+    # Play game
+    for step in range(max_steps):
+        state = game._get_state()
+
+        if with_thinking:
+            thinking, action = player.choose_action_with_thinking(game)
+            thinkings.append(thinking)
+        else:
+            action = player.choose_action(game)
+
+        infos.append(player.build_human_lite_info(game, action))
+
+        states.append(state)
+        actions.append(action)
+        action_jsons.append(build_action_json_text(state_text=state, action=ACTION_MAP[action]))
+        scores.append(game.score)
+        steps.append(step)
+
+        _, _, done, _ = game.step(action)
+
+        if done:
+            break
+
+    # Build game data
+    game_data = {
+        'schema_version': SCHEMA_VERSION,
+        'game_id': f"game_{game_idx:06d}",
+        'difficulty': difficulty,
+        'states': [],
+        'final_score': game.score,
+        'max_tile': game.get_max_tile(),
+        'total_steps': len(states)
+    }
+
+    # Add state data
+    for i in range(len(states)):
+        state_data = {
+            'state': states[i],
+            'action': ACTION_MAP[actions[i]],
+            'action_id': actions[i],
+            'action_json': json.loads(action_jsons[i]),
+            'score': scores[i],
+            'step': steps[i],
+            'info': infos[i],
+        }
+
+        if with_thinking:
+            state_data['thinking'] = thinkings[i]
+
+        game_data['states'].append(state_data)
+
+    return game_data
+
+
 def generate_games(
     num_games: int = 10000,
     max_steps: int = 10000,
@@ -1776,30 +2009,41 @@ def generate_games(
         List of games, each containing states, actions, final_score, max_tile
         If with_thinking=True, each state will also include 'thinking' field
     """
-    # 只在初始时设置全局种子，player不设置种子以保持随机性
+    # 只在初始时设置全局种子
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
 
-    # 根据with_thinking选择玩家类型
-    if with_thinking:
-        player = ThinkingHeuristicPlayer(
-            difficulty=difficulty,
-            seed=None,
-            enable_diversity=enable_diversity,
-            expert_depth=expert_depth,
-            expert_max_empty=expert_max_empty,
+    # 准备游戏生成参数
+    game_params = [
+        (
+            game_idx,
+            (seed + game_idx) if seed is not None else None,
+            max_steps,
+            difficulty,
+            with_thinking,
+            enable_diversity,
+            expert_depth,
+            expert_max_empty,
         )
-    else:
-        player = ThinkingHeuristicPlayer(
-            difficulty=difficulty,
-            seed=None,
-            enable_diversity=enable_diversity,
-            expert_depth=expert_depth,
-            expert_max_empty=expert_max_empty,
+        for game_idx in range(num_games)
+    ]
+
+    # 使用多进程生成游戏
+    num_workers = cpu_count() // 4
+    print(f"Using {num_workers} processes for game generation...")
+    
+    games = []
+    with Pool(processes=num_workers) as pool:
+        games = list(
+            tqdm(
+                pool.starmap(_generate_single_game, game_params),
+                total=num_games,
+                desc="Generating games",
+            )
         )
 
-    games = []
+    # gap_filter 在主进程中进行
     gap_filter_rng = random.Random(seed if seed is not None else 0)
     gap_filter_summary = {
         "before_steps": 0,
@@ -1808,68 +2052,9 @@ def generate_games(
         "bucket_kept": {"low": 0, "mid": 0, "high": 0},
     }
 
-    for game_idx in range(num_games):
-        # 每个游戏使用独立的种子，基于初始种子
-        game_seed = seed + game_idx if seed is not None else None
-        game = Game2048(seed=game_seed)
-        states = []
-        actions = []
-        scores = []
-        steps = []
-        thinkings = [] if with_thinking else None
-        action_jsons: List[str] = []
-
-        for step in range(max_steps):
-            state = game._get_state()
-
-            if with_thinking:
-                # 使用带思考的动作选择
-                thinking, action = player.choose_action_with_thinking(game)
-                thinkings.append(thinking)
-            else:
-                # 普通动作选择
-                action = player.choose_action(game)
-
-            states.append(state)
-            actions.append(action)
-            action_jsons.append(build_action_json_text(state_text=state, action=ACTION_MAP[action]))
-            scores.append(game.score)
-            steps.append(step)
-
-            _, _, done, _ = game.step(action)
-
-            if done:
-                break
-
-        # 构建游戏数据
-        game_data = {
-            'schema_version': SCHEMA_VERSION,
-            'game_id': f"game_{game_idx:06d}",
-            'difficulty': difficulty,
-            'states': [],
-            'final_score': game.score,
-            'max_tile': game.get_max_tile(),
-            'total_steps': len(states)
-        }
-
-        # 添加每个状态的数据
-        for i in range(len(states)):
-            state_data = {
-                'state': states[i],
-                'action': ACTION_MAP[actions[i]],
-                'action_id': actions[i],
-                'action_json': json.loads(action_jsons[i]),
-                'score': scores[i],
-                'step': steps[i]
-            }
-
-            # 如果有思考过程，添加thinking字段
-            if with_thinking:
-                state_data['thinking'] = thinkings[i]
-
-            game_data['states'].append(state_data)
-
-        if gap_filter:
+    if gap_filter:
+        print("Applying gap filter...")
+        for game_idx, game_data in enumerate(tqdm(games, desc="Filtering games")):
             game_data, step_stats = _apply_gap_filter_to_game(
                 game_data,
                 rng=gap_filter_rng,
@@ -1886,11 +2071,7 @@ def generate_games(
             for key in ("low", "mid", "high"):
                 gap_filter_summary["bucket_total"][key] += int(step_stats["bucket_total"][key])
                 gap_filter_summary["bucket_kept"][key] += int(step_stats["bucket_kept"][key])
-
-        games.append(game_data)
-
-        if (game_idx + 1) % 1000 == 0:
-            print(f"Generated {game_idx + 1}/{num_games} games")
+            games[game_idx] = game_data
 
     if gap_filter:
         before_steps = int(gap_filter_summary["before_steps"])

@@ -18,6 +18,13 @@ ACTION_MAP = {
     3: "左"
 }
 
+ACTION_MAP_ENGLISH = {
+    0: "UP",
+    1: "RIGHT",
+    2: "DOWN",
+    3: "LEFT",
+}
+
 ACTION_NAMES_ENG = {
     "up": 0,
     "right": 1,
@@ -37,6 +44,10 @@ _ACTION_TOKEN_TO_ID = {
     "右": 1,
     "下": 2,
     "左": 3,
+    "up": 0,
+    "right": 1,
+    "down": 2,
+    "left": 3,
 }
 
 _TRAILING_TEMPLATE_TOKEN_RE = re.compile(
@@ -46,9 +57,12 @@ _LEADING_TEMPLATE_TOKEN_RE = re.compile(
     r"^(?:\s*(?:<\|[^>\n]+\|>|</s>|<\s*/s\s*>))+"
 )
 _THINK_CLOSE_RE = re.compile(r"</think>", flags=re.I)
-_REQUIRED_TOP_LEVEL_KEYS = {"局面", "判断", "选择"}
-_REQUIRED_SITUATION_KEYS = {"最大数字", "位置", "在角落"}
-_REQUIRED_JUDGMENT_KEYS = {"上", "右", "下", "左"}
+_EN_TOP_LEVEL_KEYS = {"board", "judgment", "choice"}
+_EN_SITUATION_KEYS = {"max_tile", "positions", "in_corner"}
+_EN_JUDGMENT_KEYS = {"UP", "RIGHT", "DOWN", "LEFT"}
+_ZH_TOP_LEVEL_KEYS = {"局面", "判断", "选择"}
+_ZH_SITUATION_KEYS = {"最大数字", "位置", "在角落"}
+_ZH_JUDGMENT_KEYS = {"上", "右", "下", "左"}
 
 
 def _normalize_action_text(text: str) -> str:
@@ -106,36 +120,66 @@ def _is_valid_position_list(value: object) -> bool:
 def _validate_action_json_schema(obj: object) -> Optional[int]:
     if not isinstance(obj, dict):
         return None
-    if set(obj.keys()) != _REQUIRED_TOP_LEVEL_KEYS:
-        return None
 
-    situation = obj.get("局面")
-    judgment = obj.get("判断")
-    choice = obj.get("选择")
+    if set(obj.keys()) == _EN_TOP_LEVEL_KEYS:
+        situation = obj.get("board")
+        judgment = obj.get("judgment")
+        choice = obj.get("choice")
 
-    if not isinstance(situation, dict) or set(situation.keys()) != _REQUIRED_SITUATION_KEYS:
-        return None
-    if not _is_plain_int(situation.get("最大数字")):
-        return None
-    if not _is_valid_position_list(situation.get("位置")):
-        return None
-    if not isinstance(situation.get("在角落"), bool):
-        return None
+        if not isinstance(situation, dict) or set(situation.keys()) != _EN_SITUATION_KEYS:
+            return None
+        if not _is_plain_int(situation.get("max_tile")):
+            return None
+        if not _is_valid_position_list(situation.get("positions")):
+            return None
+        if not isinstance(situation.get("in_corner"), bool):
+            return None
 
-    if not isinstance(judgment, dict) or set(judgment.keys()) != _REQUIRED_JUDGMENT_KEYS:
-        return None
-    if not all(isinstance(v, bool) for v in judgment.values()):
-        return None
+        if not isinstance(judgment, dict) or set(judgment.keys()) != _EN_JUDGMENT_KEYS:
+            return None
+        if not all(isinstance(v, bool) for v in judgment.values()):
+            return None
 
-    if not isinstance(choice, str):
-        return None
-    choice_norm = choice.strip()
-    action_id = _decode_action_token(choice_norm)
-    if action_id is None:
-        return None
-    if judgment.get(choice_norm) is not True:
-        return None
-    return int(action_id)
+        if not isinstance(choice, str):
+            return None
+        choice_norm = choice.strip().upper()
+        action_id = _decode_action_token(choice_norm)
+        if action_id is None:
+            return None
+        if judgment.get(choice_norm) is not True:
+            return None
+        return int(action_id)
+
+    if set(obj.keys()) == _ZH_TOP_LEVEL_KEYS:
+        situation = obj.get("局面")
+        judgment = obj.get("判断")
+        choice = obj.get("选择")
+
+        if not isinstance(situation, dict) or set(situation.keys()) != _ZH_SITUATION_KEYS:
+            return None
+        if not _is_plain_int(situation.get("最大数字")):
+            return None
+        if not _is_valid_position_list(situation.get("位置")):
+            return None
+        if not isinstance(situation.get("在角落"), bool):
+            return None
+
+        if not isinstance(judgment, dict) or set(judgment.keys()) != _ZH_JUDGMENT_KEYS:
+            return None
+        if not all(isinstance(v, bool) for v in judgment.values()):
+            return None
+
+        if not isinstance(choice, str):
+            return None
+        choice_norm = choice.strip()
+        action_id = _decode_action_token(choice_norm)
+        if action_id is None:
+            return None
+        if judgment.get(choice_norm) is not True:
+            return None
+        return int(action_id)
+
+    return None
 
 
 def parse_action_from_non_think_text(text: str) -> Optional[int]:

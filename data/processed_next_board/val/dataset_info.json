@@ -1,0 +1,74 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "prompt": {
+      "feature": {
+        "content": {
+          "dtype": "string",
+          "_type": "Value"
+        },
+        "role": {
+          "dtype": "string",
+          "_type": "Value"
+        }
+      },
+      "_type": "List"
+    },
+    "completion": {
+      "feature": {
+        "content": {
+          "dtype": "string",
+          "_type": "Value"
+        },
+        "role": {
+          "dtype": "string",
+          "_type": "Value"
+        }
+      },
+      "_type": "List"
+    },
+    "schema_version": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "task_type": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "source_type": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "source_game_index": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "source_step": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "action": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "action_id": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "num_valid_actions": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "board_sum": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "max_tile": {
+      "dtype": "int64",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

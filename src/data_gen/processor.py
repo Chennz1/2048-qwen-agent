@@ -20,6 +20,7 @@ from src.data_gen.contracts import (
     validate_raw_game,
 )
 from src.data_gen.prompting import build_messages
+from src.envs.game_2048 import ACTION_MAP_ENGLISH, parse_action_from_non_think_text
 
 
 
@@ -307,10 +308,9 @@ def analyze_dataset(dataset: Dataset, name: str = "Dataset") -> None:
     actions = []
     for item in dataset:
         text = _sample_response_text(item).rstrip()
-        for action in ["上", "右", "下", "左"]:
-            if text.endswith(action):
-                actions.append(action)
-                break
+        action_id = parse_action_from_non_think_text(text)
+        if action_id is not None:
+            actions.append(ACTION_MAP_ENGLISH[action_id])
 
     unique_actions = sorted(set(actions))
     print(f"\n唯一动作: {len(unique_actions)}")

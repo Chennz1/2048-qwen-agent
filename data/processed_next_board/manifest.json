@@ -1,0 +1,25 @@
+{
+  "manifest_version": "1.0",
+  "created_at_utc": "2026-04-06T09:06:39.099237+00:00",
+  "stage": "synthetic_next_board_dataset",
+  "schema_version": "1.0",
+  "output_dir": "data/processed_next_board",
+  "generator": "random_rollout",
+  "config": {
+    "num_samples": 4096,
+    "max_rollout_steps": 200,
+    "min_steps_before_collect": 0,
+    "train_ratio": 0.9,
+    "val_ratio": 0.08,
+    "test_ratio": 0.02,
+    "seed": 42,
+    "strict_validation": true,
+    "include_metadata": true
+  },
+  "sizes": {
+    "total": 4096,
+    "train": 3686,
+    "val": 327,
+    "test": 83
+  }
+}

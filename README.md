@@ -128,9 +128,9 @@ bash scripts/generate_data.sh \
 
 ```bash
 bash scripts/generate_expert_cot_data.sh \
-  --num_games 2000 \
-  --expert_depth 2 \
-  --expert_max_empty 8 \
+  --num_games 1000 \
+  --expert_depth 3 \
+  --expert_max_empty 6 \
   --output_dir data/raw_expert \
   --seed 42
 ```
@@ -139,7 +139,7 @@ bash scripts/generate_expert_cot_data.sh \
 
 ```bash
 python -m src.data_gen.processor \
-  --input_dir data/raw \
+  --input_dir data/raw_expert \
   --output_dir data/processed \
   --use_thinking \
   --validate
@@ -301,3 +301,109 @@ python -m src.eval.agent_eval \
 
 1. Mac 适合做数据与流程验证，长时训练建议在 NVIDIA GPU 服务器执行。
 2. 做模型对比时请固定评测集、推理参数和 seed，否则结果不可比。
+
+
+python -m src.data_gen.next_board_processor \
+    --output_dir data/processed_next_board \
+    --num_samples 4096 \
+    --validate
+
+## grpo
+
+    CUDA_VISIBLE_DEVICES=0 python -m src.models.next_board_grpo \
+    --model /home/cnz/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
+    --input_dir data/processed_next_board/train \
+    --output_dir checkpoints/grpo_next_board \
+    --num_samples 4096 \
+    --epochs 1 \
+    --batch_size 2 \
+    --grad_accum 16 \
+    --num_generations 2 \
+    --lr 5e-6 \
+    --max_prompt_length 1024 \
+    --max_completion_length 256 \
+    --save_steps 0.25 \
+    --logging_steps 5 \
+    --monitor_backend tensorboard
+
+  CUDA_VISIBLE_DEVICES=0 python -m src.models.next_board_grpo_lora \
+    --model /home/cnz/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
+    --input_dir data/processed_next_board/train \
+    --output_dir checkpoints/grpo_next_board_lora \
+    --num_samples 4096 \
+    --epochs 1 \
+    --batch_size 4 \
+    --grad_accum 8 \
+    --num_generations 2 \
+    --lr 5e-6 \
+    --use_lora \
+    --lora_r 32 \
+    --lora_alpha 64 \
+    --lora_dropout 0.05 \
+    --monitor_backend tensorboard
+
+  参数含义简要如下：
+
+  - --model：SFT 初始化模型或已有 checkpoint。
+  - --input_dir：next-board 训练集目录，通常是 data/processed_next_board/train。
+  - --output_dir：GRPO 输出目录。
+  - --num_samples：从数据集中采样多少条 prompt 做训练。
+  - --epochs：训练轮数。
+  - --batch_size：每卡 batch size。
+  - --grad_accum：梯度累积步数。
+  - --num_generations：每个 prompt 采样多少个 completion 做 GRPO 对比。
+  - --lr：学习率。
+  - --max_prompt_length：prompt 最大长度。
+  - --max_completion_length：生成 JSON 的最大长度。
+  - --monitor_backend none：关闭 wandb/tensorboard。
+
+  如果你想先做一个最小冒烟版，可以把它缩成：
+
+  python -m src.models.next_board_grpo \
+    --model checkpoints/sft_next_board \
+    --input_dir data/processed_next_board/train \
+    --output_dir /tmp/grpo_next_board_smoke \
+    --num_samples 64 \
+    --epochs 1 \
+    --batch_size 2 \
+    --grad_accum 2 \
+    --num_generations 2 \
+    --monitor_backend none
+
+
+
+mkdir -p ~/flash_attn_wheel_factory
+
+docker run --rm --gpus 0 \
+  -v ~/flash_attn_wheel_factory:/output \
+  nvidia/cuda:12.8.0-devel-ubuntu24.04 /bin/bash -c '
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      curl git build-essential python3.10 python3.10-venv python3.10-dev tzdata
+
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="/usr/local/bin" sh
+    /usr/local/bin/uv venv --seed /tmp/build_env --python 3.10
+    source /tmp/build_env/bin/activate
+
+    uv pip install torch ninja packaging wheel
+
+    export MAX_JOBS=4
+    export FLASH_ATTENTION_FORCE_BUILD=TRUE
+    export FLASH_ATTENTION_FORCE_CXX11_ABI=TRUE
+
+    pip wheel --no-build-isolation \
+      git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3
+    cp /tmp/flash_attn*.whl /output/
+  '
+
+
+  <!-- # 1. 退出当前环境
+conda deactivate
+
+# 2. 移除整个环境 (假设环境名叫 rl)
+conda remove --name rl --all -y
+
+# 3. 重新创建一个干净的环境
+conda create --name rl python=3.12 -y  # 建议用 3.10，对 vllm 和 torch 兼容性最稳
+
+# 4. 激活并重新用 uv 安装
+conda activate rl -->
