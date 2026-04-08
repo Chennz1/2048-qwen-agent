@@ -157,6 +157,9 @@ def _build_grpo_config(
     logging_steps: int,
     disable_tqdm: bool,
     generation_kwargs: Optional[Dict[str, Any]],
+    log_completions: bool,
+    num_completions_to_print: int,
+    log_unique_prompts: bool,
     report_to: List[str],
     clip_eps: float,
     kl_beta: float,
@@ -182,6 +185,9 @@ def _build_grpo_config(
         "disable_tqdm": bool(disable_tqdm),
         "logging_steps": logging_steps,
         "generation_kwargs": generation_kwargs,
+        "log_completions": bool(log_completions),
+        "num_completions_to_print": int(num_completions_to_print),
+        "log_unique_prompts": bool(log_unique_prompts),
         "report_to": report_to,
         "use_vllm": False,  # 关闭 vLLM 以省下预分配显存
         "gradient_checkpointing": True,  # 开启梯度检查点，极大降低反向传播时的显存峰值
@@ -297,10 +303,25 @@ def build_grpo_generation_kwargs(tokenizer: Optional[Any]) -> Optional[Dict[str,
         "top_k": 20,
         "min_p": 0.0,
     }
+    
+    eos_token_ids = []
     if eos_token_id is not None:
-        kwargs["eos_token_id"] = int(eos_token_id)
+        if isinstance(eos_token_id, list):
+            eos_token_ids.extend(eos_token_id)
+        else:
+            eos_token_ids.append(int(eos_token_id))
+    
+    # 显式追加可能导致无限生成的特定 stop token，防止截断被意外覆盖
+    for stop_str in ["<|im_end|>", "<|endoftext|>"]:
+        stop_id = tokenizer.convert_tokens_to_ids(stop_str)
+        if stop_id is not None and stop_id != getattr(tokenizer, "unk_token_id", None):
+            eos_token_ids.append(stop_id)
+            
+    if eos_token_ids:
+        kwargs["eos_token_id"] = list(set(eos_token_ids))
+        
     if pad_token_id is not None:
-        kwargs["pad_token_id"] = int(pad_token_id)
+        kwargs["pad_token_id"] = int(pad_token_id) if not isinstance(pad_token_id, list) else int(pad_token_id[0])
     return kwargs
 
 
@@ -1022,6 +1043,9 @@ class TRLGRPO2048Trainer:
         save_steps: float = 200,
         logging_steps: int = 4,
         disable_tqdm: bool = False,
+        log_completions: bool = False,
+        num_completions_to_print: int = 4,
+        log_unique_prompts: bool = False,
     ):
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
 
@@ -1051,6 +1075,9 @@ class TRLGRPO2048Trainer:
             logging_steps=logging_steps,
             disable_tqdm=disable_tqdm,
             generation_kwargs=generation_kwargs,
+            log_completions=log_completions,
+            num_completions_to_print=num_completions_to_print,
+            log_unique_prompts=log_unique_prompts,
             report_to=report_to,
             clip_eps=clip_eps,
             kl_beta=kl_beta,
@@ -1270,6 +1297,9 @@ def main():
     parser.add_argument("--save_steps", type=float, default=1000)
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--disable_tqdm", action="store_true")
+    parser.add_argument("--log_completions", action="store_true")
+    parser.add_argument("--num_completions_to_print", type=int, default=4)
+    parser.add_argument("--log_unique_prompts", action="store_true")
     parser.add_argument(
         "--reward_mode",
         type=str,
@@ -1382,6 +1412,9 @@ def main():
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         disable_tqdm=args.disable_tqdm,
+        log_completions=args.log_completions,
+        num_completions_to_print=args.num_completions_to_print,
+        log_unique_prompts=args.log_unique_prompts,
     )
 
 

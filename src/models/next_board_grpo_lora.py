@@ -113,6 +113,9 @@ class TRLGRPONextBoardLoraTrainer:
         save_steps: float = 200,
         logging_steps: int = 4,
         disable_tqdm: bool = False,
+        log_completions: bool = False,
+        num_completions_to_print: int = 4,
+        log_unique_prompts: bool = False,
     ) -> Any:
         GRPOConfig, GRPOTrainer = _load_trl_grpo_symbols()
         report_to = report_to_list(self.monitor_backend)
@@ -141,6 +144,9 @@ class TRLGRPONextBoardLoraTrainer:
             logging_steps=logging_steps,
             disable_tqdm=disable_tqdm,
             generation_kwargs=generation_kwargs,
+            log_completions=log_completions,
+            num_completions_to_print=num_completions_to_print,
+            log_unique_prompts=log_unique_prompts,
             report_to=report_to,
             clip_eps=clip_eps,
             kl_beta=kl_beta,
@@ -231,6 +237,9 @@ def main() -> None:
     parser.add_argument("--save_steps", type=float, default=500)
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--disable_tqdm", action="store_true")
+    parser.add_argument("--log_completions", action="store_true")
+    parser.add_argument("--num_completions_to_print", type=int, default=4)
+    parser.add_argument("--log_unique_prompts", action="store_true")
     parser.add_argument("--reward_json_invalid_penalty", type=float, default=-20.0)
     parser.add_argument("--reward_exact_board_bonus", type=float, default=6.0)
     parser.add_argument("--reward_consistent_with_env_bonus", type=float, default=2.0)
@@ -247,6 +256,7 @@ def main() -> None:
         choices=["wandb", "tensorboard", "none"],
     )
     parser.add_argument("--no_thinking", action="store_true")
+    parser.add_argument("--prefill_reasoning_prefix", action="store_true")
     args = parser.parse_args()
 
     model_name_or_path = args.base_model or args.model
@@ -262,6 +272,7 @@ def main() -> None:
     builder = NextBoardGRPODatasetBuilder(
         model_name=model_name_or_path,
         use_thinking=not args.no_thinking,
+        prefill_reasoning_prefix=args.prefill_reasoning_prefix,
     )
     train_dataset = builder.build(
         data_dir=args.input_dir,
@@ -305,6 +316,9 @@ def main() -> None:
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         disable_tqdm=args.disable_tqdm,
+        log_completions=args.log_completions,
+        num_completions_to_print=args.num_completions_to_print,
+        log_unique_prompts=args.log_unique_prompts,
     )
 
 
